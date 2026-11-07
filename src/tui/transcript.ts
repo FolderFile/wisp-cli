@@ -15,7 +15,11 @@ const TOOL_TITLES: Record<string, string> = {
   ls: 'List',
 };
 
-export const toolTitle = (name: string) => TOOL_TITLES[name] ?? name;
+export const toolTitle = (name: string) => {
+  if (TOOL_TITLES[name]) return TOOL_TITLES[name];
+  const m = /^mcp__(.+?)__(.+)$/.exec(name);
+  return m ? `${m[1]} › ${m[2]}` : name;
+};
 
 type ToolStatus = 'ok' | 'error' | 'running' | 'pending';
 

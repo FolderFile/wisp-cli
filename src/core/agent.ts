@@ -93,6 +93,12 @@ export class Agent {
     return clampThinking(this.opts.thinking, this.opts.model);
   }
 
+  /** Replace the tool set (e.g. when MCP servers connect); applies from the next request. */
+  setTools(tools: Tool[]) {
+    this.opts.tools = tools;
+    this.toolsByName = new Map(tools.map((t) => [t.name, t]));
+  }
+
   setModel(provider: Provider, model: ModelInfo) {
     this.opts.provider = provider;
     this.opts.model = model;
@@ -155,8 +161,8 @@ export class Agent {
   }
 
   private async loop(signal: AbortSignal) {
-    const specs = this.opts.tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema }));
     for (let step = 0; step < MAX_STEPS; step++) {
+      const specs = this.opts.tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema }));
       if (this.shouldCompact()) {
         await this.compact(signal, { auto: true });
         this.append({ role: 'user', content: [{ type: 'text', text: 'Continue with the task where you left off.' }] });

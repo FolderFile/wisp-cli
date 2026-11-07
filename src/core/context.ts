@@ -160,6 +160,7 @@ export interface SystemPromptParts {
   skills: Skill[];
   override?: string;
   append?: string[];
+  mcpInstructions?: { server: string; text: string }[];
 }
 
 /**
@@ -176,7 +177,14 @@ export function buildSystemPrompt(p: SystemPromptParts): string {
 - Platform: ${process.platform}
 - Git repository: ${gitInfo(p.cwd)}
 - Today's date: ${new Date().toISOString().slice(0, 10)}
-- Available tools: ${p.tools.map((t) => t.name).join(', ')}`);
+- Available tools: ${describeTools(p.tools)}`);
+
+  if (p.mcpInstructions?.length) {
+    sections.push(
+      '# MCP servers\nTools named mcp__<server>__<tool> come from these connected MCP servers. Their own usage notes:\n\n' +
+        p.mcpInstructions.map((i) => `<server name="${i.server}">\n${i.text}\n</server>`).join('\n\n'),
+    );
+  }
 
   if (p.contextFiles.length) {
     sections.push(
@@ -195,4 +203,13 @@ export function buildSystemPrompt(p: SystemPromptParts): string {
   const appendFile = readIf(join(p.cwd, '.wisp', 'APPEND_SYSTEM.md')) ?? readIf(join(AGENT_DIR, 'APPEND_SYSTEM.md'));
   for (const extra of [appendFile, ...(p.append ?? [])]) if (extra?.trim()) sections.push(extra.trim());
   return sections.join('\n\n');
+}
+
+/** Built-in tools by name; MCP tools summarized per server (there can be dozens). */
+function describeTools(tools: Tool[]): string {
+  const builtin = tools.filter((t) => !t.mcp).map((t) => t.name);
+  const perServer = new Map<string, number>();
+  for (const t of tools) if (t.mcp) perServer.set(t.mcp.server, (perServer.get(t.mcp.server) ?? 0) + 1);
+  const mcp = [...perServer].map(([s, n]) => `${n} from MCP server "${s}"`);
+  return [...builtin, ...mcp].join(', ');
 }

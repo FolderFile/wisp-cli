@@ -7,6 +7,7 @@ import { availableModels, createProvider, getModelInfo, parseModelRef, resolveMo
 import { buildSystemPrompt, discoverContextFiles, discoverSkills } from './core/context.js';
 import { describeError } from './core/errors.js';
 import { exportSession } from './core/export.js';
+import { isProjectTrusted, loadMcpConfig, McpManager } from './core/mcp.js';
 import { BUILTIN_MODELS, PROVIDERS } from './core/models.js';
 import { findSession, forkSession, listSessions, readEntries, restore, Session, type RestoredState } from './core/session.js';
 import { GLOBAL_SETTINGS, PERMISSION_MODES, SettingsStore, type PermissionMode } from './core/settings.js';
@@ -50,6 +51,12 @@ ${pc.bold('Behaviour')}
   --append-system-prompt <t>   append to the system prompt (repeatable)
   --no-context-files           don't load AGENTS.md / CLAUDE.md
   --tui-mode <mode>            fullscreen (default: own screen, scrollable) | inline (normal scrollback)
+  --no-mcp                     don't start MCP servers
+  --mcp-config <file>          load MCP servers from this file too (repeatable)
+  --trust-project              start this project's MCP servers without asking
+
+${pc.bold('MCP')}
+  wisp mcp list|get|add|remove manage MCP servers (wisp mcp --help)
   -h, --help · -v, --version
 
 ${pc.bold('Files')}
@@ -58,6 +65,7 @@ ${pc.bold('Files')}
   prompts    ~/.wisp/prompts/*.md, .wisp/prompts/*.md  → /name
   skills     ~/.wisp/skills/<name>/SKILL.md, .wisp/skills/…
   sessions   ~/.wisp/sessions/
+  mcp        ~/.wisp/mcp.json, .mcp.json, .wisp/mcp.json
 `;
 
 /** Pipes and redirected files carry input; other non-TTY handles may never close. */
@@ -82,6 +90,10 @@ async function readStdin(): Promise<string> {
 const textOrFile = (v: string) => (existsSync(v) ? readFileSync(v, 'utf8') : v);
 
 async function main(): Promise<number> {
+  if (process.argv[2] === 'mcp') {
+    const { mcpCli } = await import('./mcp-cli.js');
+    return mcpCli(process.argv.slice(3), process.cwd());
+  }
   const { values: f, positionals } = parseArgs({
     allowPositionals: true,
     options: {
@@ -106,6 +118,9 @@ async function main(): Promise<number> {
       'append-system-prompt': { type: 'string', multiple: true },
       'no-context-files': { type: 'boolean' },
       'tui-mode': { type: 'string' },
+      'no-mcp': { type: 'boolean' },
+      'mcp-config': { type: 'string', multiple: true },
+      'trust-project': { type: 'boolean' },
       help: { type: 'boolean', short: 'h' },
       version: { type: 'boolean', short: 'v' },
     },
@@ -196,6 +211,7 @@ async function main(): Promise<number> {
   }
 
   const appendSystem = (f['append-system-prompt'] ?? []).map(textOrFile);
+  const mcpServers = f['no-mcp'] ? [] : loadMcpConfig(cwd, f['mcp-config'] ?? []);
   const systemOverride = f['system-prompt'] ? textOrFile(f['system-prompt']) : undefined;
 
   if (nonInteractive) {
@@ -221,7 +237,34 @@ async function main(): Promise<number> {
       autoCompactAt: settings.autoCompactAt,
     });
     if (restored) agent.load(restored.messages, restored);
-    return runPrint(agent, session, prompt, cwd, f.json ? 'json' : 'text');
+    // MCP: no one to ask here, so untrusted project servers are skipped
+    let mcp: McpManager | null = null;
+    if (mcpServers.length) {
+      const trusted = f['trust-project'] || isProjectTrusted(cwd, mcpServers);
+      const runnable = mcpServers.filter((e) => trusted || e.scope !== 'project');
+      if (runnable.length < mcpServers.length)
+        process.stderr.write(pc.yellow('Skipping project MCP servers: approve them once in interactive wisp, or pass --trust-project.\n'));
+      if (runnable.length) {
+        mcp = new McpManager(runnable, cwd);
+        await mcp.start();
+        for (const s of mcp.servers) if (s.status === 'failed') process.stderr.write(pc.red(`MCP ${s.name} failed: ${s.error}\n`));
+        agent.setTools([...tools, ...mcp.tools()]);
+        agent.opts.system = buildSystemPrompt({
+          cwd,
+          tools: agent.tools,
+          contextFiles: f['no-context-files'] ? [] : discoverContextFiles(cwd),
+          skills: discoverSkills(cwd),
+          override: systemOverride,
+          append: appendSystem,
+          mcpInstructions: mcp.instructions(),
+        });
+      }
+    }
+    try {
+      return await runPrint(agent, session, prompt, cwd, f.json ? 'json' : 'text');
+    } finally {
+      await mcp?.close();
+    }
   }
 
   const tuiMode = (f['tui-mode'] ?? process.env.WISP_TUI_MODE ?? settings.tuiMode ?? 'fullscreen') as 'fullscreen' | 'inline';
@@ -243,8 +286,11 @@ async function main(): Promise<number> {
     persistSessions: persist,
     tuiMode,
     mouse: settings.mouse ?? true,
+    mcpServers,
+    trustProjectMcp: Boolean(f['trust-project']),
   });
   await app.run();
+  await app.shutdown();
   return 0;
 }
 

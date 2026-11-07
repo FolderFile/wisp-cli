@@ -29,6 +29,8 @@ export interface Tool<I = any> {
   description: string;
   inputSchema: JSONSchema;
   permission: PermissionLevel;
+  /** Set for tools that come from an MCP server. */
+  mcp?: { server: string; tool: string; readOnly: boolean };
   /** Short label for the transcript, e.g. the file path or command. */
   label(input: I): string;
   /** What the user sees when asked to approve (e.g. a diff). */
@@ -48,12 +50,31 @@ export function validateInput(tool: Tool, input: Record<string, unknown>): strin
     if (input[key] === undefined || input[key] === null) return `Missing required parameter "${key}"`;
   }
   for (const [key, value] of Object.entries(input)) {
-    const prop = tool.inputSchema.properties[key];
+    const prop = tool.inputSchema.properties?.[key];
     if (!prop || value === undefined || value === null) continue;
-    const t = prop.type === 'integer' ? 'number' : prop.type;
-    if (typeof value !== t) return `Parameter "${key}" must be of type ${prop.type}`;
+    // Only check simple top-level types; complex schemas (anyOf, unions) are left to the tool.
+    if (typeof prop.type === 'string' && !matchesType(value, prop.type)) return `Parameter "${key}" must be of type ${prop.type}`;
     if (prop.enum && !prop.enum.includes(value as string))
       return `Parameter "${key}" must be one of: ${prop.enum.join(', ')}`;
   }
   return null;
+}
+
+function matchesType(value: unknown, type: string): boolean {
+  switch (type) {
+    case 'string':
+      return typeof value === 'string';
+    case 'number':
+      return typeof value === 'number';
+    case 'integer':
+      return typeof value === 'number' && Number.isInteger(value);
+    case 'boolean':
+      return typeof value === 'boolean';
+    case 'array':
+      return Array.isArray(value);
+    case 'object':
+      return typeof value === 'object' && !Array.isArray(value);
+    default:
+      return true;
+  }
 }

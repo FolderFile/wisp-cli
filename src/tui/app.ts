@@ -16,6 +16,7 @@ import {
 } from '../core/context.js';
 import { describeError, isAbortError } from '../core/errors.js';
 import { exportSession } from '../core/export.js';
+import { describeServer, isProjectTrusted, McpManager, trustProject, type McpServerEntry, type McpStatus } from '../core/mcp.js';
 import { buildUserContent, droppedImagePath } from '../core/input.js';
 import { BUILTIN_MODELS, type ModelInfo } from '../core/models.js';
 import { firstUserText, forkSession, listSessions, restore, Session, type RestoredState } from '../core/session.js';
@@ -55,6 +56,10 @@ export interface AppOptions {
   persistSessions: boolean;
   tuiMode: 'fullscreen' | 'inline';
   mouse: boolean;
+  /** Configured MCP servers (already filtered by --no-mcp). */
+  mcpServers: McpServerEntry[];
+  /** --trust-project: start project MCP servers without asking. */
+  trustProjectMcp: boolean;
 }
 
 /** $VISUAL, $EDITOR, or the first common editor that is installed. */
@@ -83,6 +88,7 @@ const COMMANDS: CommandInfo[] = [
   { name: 'reload', description: 'Reload AGENTS.md, skills and prompt templates' },
   { name: 'settings', description: 'Edit settings in $EDITOR' },
   { name: 'mouse', description: 'Toggle mouse capture (off: select text normally)' },
+  { name: 'mcp', description: 'MCP servers: status, tools, reconnect', args: '[tools|reconnect] [server]' },
   { name: 'hotkeys', description: 'Keyboard shortcuts' },
   { name: 'help', description: 'Commands and shortcuts' },
   { name: 'exit', description: 'Quit (ctrl+d)' },
@@ -147,6 +153,8 @@ export class App {
   private skills: Skill[] = [];
   private templates: PromptTemplate[] = [];
   private ollamaModels: ModelInfo[] = [];
+  private mcp: McpManager | null = null;
+  private mcpStatus = new Map<string, McpStatus>();
   private exitResolve: (() => void) | null = null;
 
   constructor(private o: AppOptions) {
@@ -192,7 +200,8 @@ export class App {
   private systemPrompt() {
     return buildSystemPrompt({
       cwd: this.o.cwd,
-      tools: this.o.tools,
+      tools: this.agent?.tools ?? this.o.tools,
+      mcpInstructions: this.mcp?.instructions(),
       contextFiles: this.contextFiles,
       skills: this.skills,
       override: this.o.systemOverride,
@@ -254,8 +263,116 @@ export class App {
       this.render();
     });
     this.render();
+    await this.startMcp();
     if (this.o.initialPrompt) void this.submitText(this.o.initialPrompt);
     await new Promise<void>((r) => (this.exitResolve = r));
+  }
+
+  /** Called by main() after run() returns: stop MCP server processes. */
+  async shutdown() {
+    await this.mcp?.close();
+  }
+
+  // --- MCP --------------------------------------------------------------------
+
+  private async startMcp() {
+    let entries = this.o.mcpServers;
+    if (!entries.length) return;
+    const project = entries.filter((e) => e.scope === 'project');
+    if (project.length && !this.o.trustProjectMcp && !isProjectTrusted(this.o.cwd, entries)) {
+      const answer = await this.askProjectTrust(project);
+      if (answer === 'always') trustProject(this.o.cwd, entries);
+      if (answer === 'no') {
+        entries = entries.filter((e) => e.scope !== 'project');
+        this.transcript.notice(`Skipped ${project.length} project MCP server${project.length > 1 ? 's' : ''}. Restart wisp to be asked again.`, 'warn');
+      }
+    }
+    if (!entries.length) return;
+    this.mcp = new McpManager(entries, this.o.cwd);
+    this.mcp.onChange(() => this.onMcpChange());
+    void this.mcp.start();
+  }
+
+  private askProjectTrust(project: McpServerEntry[]): Promise<'always' | 'once' | 'no'> {
+    return new Promise((resolveTrust) => {
+      const w = this.width;
+      const header = [
+        theme.border('─'.repeat(w)),
+        theme.warn(' This project wants to start MCP servers:'),
+        ...project.map((e) => `   ${theme.bold(e.name)}  ${theme.dim(truncate(describeServer(e.config), w - e.name.length - 6))}`),
+        theme.dim(` from ${[...new Set(project.map((e) => shortenHome(e.source)))].join(', ')} · they run with your permissions`),
+        '',
+      ];
+      const list = new SelectList<'always' | 'once' | 'no'>(
+        [
+          { label: 'Yes, and remember for this project', value: 'always', hotkey: 'y', detail: 'asks again if the config changes' },
+          { label: 'Yes, just this time', value: 'once', hotkey: 'o' },
+          { label: "No, don't start them", value: 'no', hotkey: 'n', detail: 'esc' },
+        ],
+        { title: 'Start project MCP servers?', hint: 'y/o/n · ↑↓ enter' },
+      );
+      this.openOverlay(list, resolveTrust, header, () => resolveTrust('no'));
+    });
+  }
+
+  /** Servers came up, failed or changed their tools: refresh tools, prompt and notices. */
+  private onMcpChange() {
+    const mcp = this.mcp!;
+    this.agent.setTools([...this.o.tools, ...mcp.tools()]);
+    this.agent.opts.system = this.systemPrompt();
+    for (const s of mcp.servers) {
+      const prev = this.mcpStatus.get(s.name);
+      if (prev === s.status) continue;
+      this.mcpStatus.set(s.name, s.status);
+      if (s.status === 'connected') this.transcript.notice(`✓ MCP ${s.name}: ${s.tools.length} tool${s.tools.length === 1 ? '' : 's'}`, 'success');
+      else if (s.status === 'failed') this.transcript.notice(`✗ MCP ${s.name} failed: ${s.error ?? 'unknown error'} · /mcp for details`, 'error');
+    }
+    this.render();
+  }
+
+  private mcpCommand(args: string) {
+    const t = this.transcript;
+    const [sub, name] = args.split(/\s+/).filter(Boolean);
+    const mcp = this.mcp;
+    if (!mcp?.servers.length) {
+      if (this.o.mcpServers.length) return t.notice('MCP servers are configured but were not started (skipped project servers, or --no-mcp).');
+      return t.notice('No MCP servers configured. Add one with: wisp mcp add <name> -- <command> [args…]   or   wisp mcp add <name> --url <url>');
+    }
+    const pick = (n?: string) => {
+      const s = n ? mcp.get(n) : undefined;
+      if (n && !s) t.notice(`No MCP server named "${n}". Configured: ${mcp.servers.map((x) => x.name).join(', ')}`, 'error');
+      return s;
+    };
+    if (sub === 'reconnect') {
+      const targets = name ? [pick(name)].filter(Boolean) : mcp.servers.filter((s) => s.status !== 'disabled');
+      for (const s of targets) {
+        this.mcpStatus.delete(s!.name);
+        t.notice(`Reconnecting ${s!.name}…`);
+        void s!.connect();
+      }
+      return;
+    }
+    if (sub === 'tools') {
+      const servers = name ? [pick(name)].filter(Boolean) : mcp.servers;
+      t.blank();
+      for (const s of servers) {
+        t.commit(theme.bold(`${s!.name}`) + theme.dim(` · ${s!.tools.length} tools`));
+        for (const tool of s!.tools) t.commit(`  ${theme.accent(tool.name)}  ${theme.dim(truncate((tool.description ?? '').split('\n')[0], 100))}`);
+      }
+      t.blank();
+      return;
+    }
+    const icon: Record<McpStatus, string> = { connected: theme.success('●'), failed: theme.error('●'), connecting: theme.warn('◌'), disabled: theme.dim('○') };
+    t.blank();
+    t.commit(theme.bold('MCP servers'));
+    for (const s of mcp.servers) {
+      const info = s.status === 'connected' ? `${s.tools.length} tools${s.serverInfo ? ` · ${s.serverInfo.name} ${s.serverInfo.version}` : ''}` : s.status === 'failed' ? (s.error ?? 'failed') : s.status;
+      t.commit(`  ${icon[s.status]} ${theme.bold(s.name)} ${theme.dim(`(${s.entry.scope})`)}  ${s.status === 'failed' ? theme.error(info) : theme.dim(info)}`);
+      t.commit(theme.dim(`      ${describeServer(s.entry.config)}`));
+      if (s.status === 'failed' && s.stderr.length) for (const l of s.stderr.slice(-5)) t.commit(theme.dim(`      │ ${l}`));
+    }
+    t.commit(theme.dim('  /mcp tools [server] · /mcp reconnect [server] · config: ~/.wisp/mcp.json, .mcp.json'));
+    t.blank();
   }
 
   private header() {
@@ -392,7 +509,13 @@ export class App {
     const where = shortenHome(this.o.cwd) + (this.gitBranch ? ` (${this.gitBranch})` : '');
     const name = this.session.name ? ` · ${this.session.name}` : '';
     const mode = s.opts.permissionMode === 'ask' ? '' : ` · ${s.opts.permissionMode === 'yolo' ? theme.warn('yolo') : 'auto-edit'}`;
-    const line1 = spread(theme.dim(where + name), theme.dim(`${this.model.id}`) + mode, w);
+    let mcp = '';
+    if (this.mcp?.servers.length) {
+      const m = this.mcp.summary;
+      const text = m.connecting ? `mcp ${m.connected}/${m.total}…` : m.failed ? `mcp ${m.connected}/${m.total}` : `mcp ${m.connected}`;
+      mcp = (m.failed ? theme.warn(text) : theme.dim(text)) + theme.dim(' · ');
+    }
+    const line1 = spread(theme.dim(where + name), mcp + theme.dim(`${this.model.id}`) + mode, w);
 
     const ctxPct = this.model.contextWindow ? Math.round((s.contextUsed / this.model.contextWindow) * 100) : 0;
     const ctxColor = ctxPct >= 80 ? theme.error : ctxPct >= 60 ? theme.warn : theme.dim;
@@ -618,6 +741,14 @@ export class App {
 
   private async prompt(text: string, display: string) {
     this.transcript.user(display);
+    // give MCP servers that are still starting a moment, so their tools are there
+    if (this.mcp?.summary.connecting) {
+      this.flashMessage('waiting for MCP servers…', 5000);
+      this.render();
+      await this.mcp.ready(5000);
+      const slow = this.mcp.servers.filter((s) => s.status === 'connecting').map((s) => s.name);
+      if (slow.length) this.transcript.notice(`MCP ${slow.join(', ')} still starting; their tools will appear once connected.`, 'warn');
+    }
     const { content, attachments } = await buildUserContent(text, this.o.cwd, { images: this.model.images, readFiles: this.agent.readFiles });
     for (const a of attachments) this.transcript.notice(`${a.note ? '⚠' : '⎘'} attached ${a.path}${a.kind === 'dir' ? '/' : ''}${a.note ? ` (${a.note})` : ''}`, a.note ? 'warn' : 'info');
     if (attachments.length) this.transcript.blank();
@@ -672,14 +803,14 @@ export class App {
       let body = preview.split('\n').flatMap((l) => wrap(l, w - 2));
       if (body.length > maxPreview) body = [...body.slice(0, maxPreview), theme.dim(`… ${body.length - maxPreview} more lines`)];
       const header = [theme.border('─'.repeat(w)), ...body.map((l) => ' ' + l), ''];
-      const what = tool.permission === 'exec' ? 'commands' : 'edits';
+      const what = tool.mcp ? 'calls' : tool.permission === 'exec' ? 'commands' : 'edits';
       const list = new SelectList<Approval>(
         [
           { label: 'Yes', value: 'yes', hotkey: 'y', detail: 'y' },
-          { label: `Yes, and allow ${tool.name} ${what} for this session`, value: 'always', hotkey: 'a', detail: 'a' },
+          { label: `Yes, and allow ${tool.mcp ? `${tool.mcp.server} › ${tool.mcp.tool}` : tool.name} ${what} for this session`, value: 'always', hotkey: 'a', detail: 'a' },
           { label: 'No, tell wisp what to do instead', value: 'no', hotkey: 'n', detail: 'n · esc' },
         ],
-        { title: `Allow ${tool.name}?`, hint: 'y/a/n · ↑↓ enter' },
+        { title: `Allow ${tool.mcp ? `${tool.mcp.server} › ${tool.mcp.tool}` : tool.name}?`, hint: 'y/a/n · ↑↓ enter' },
       );
       const done = (a: Approval) => {
         signal.removeEventListener('abort', onAbort);
@@ -985,6 +1116,8 @@ export class App {
         if (!this.full) return t.notice('Mouse capture is only used in fullscreen mode.');
         this.term.setMouse(!this.term.mouse);
         return t.notice(this.term.mouse ? 'Mouse captured: the wheel scrolls the conversation (shift+drag to select).' : 'Mouse released: select text normally; scroll with pgup/pgdn.');
+      case 'mcp':
+        return this.mcpCommand(args);
       case 'exit':
       case 'quit':
         return this.exit();

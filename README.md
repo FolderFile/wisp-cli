@@ -8,6 +8,7 @@ A coding agent for your terminal that works with any provider. Wisp reads your c
 - **Sessions** that save automatically and can be continued, resumed, forked, compacted and exported.
 - **A model picker and thinking-level control**, plus a footer showing context use, tokens and cost.
 - **Project context files and extensions:** `AGENTS.md`/`CLAUDE.md`, skills, and prompt templates.
+- **MCP servers** over stdio, Streamable HTTP or SSE, using the `mcpServers` config format other tools already use.
 
 ```
 ▌ node test.js fails. Fix it.
@@ -111,6 +112,38 @@ Every conversation is saved as an append-only JSONL file under `~/.wisp/sessions
 - **Skills:** a skill is a `<dir>/<name>/SKILL.md` file with `name` and `description` frontmatter, kept in `~/.wisp/skills`, `.wisp/skills` or `.claude/skills`. The model sees each skill's description and reads the file when a task matches. You can force a skill with `/skill:<name>`.
 - **Prompt templates:** `~/.wisp/prompts/review.md` or `.wisp/prompts/review.md` becomes the command `/review`. Templates support `$ARGUMENTS` and `$1`…`$9`.
 
+## MCP servers
+
+Wisp can use tools from any [MCP](https://modelcontextprotocol.io) server: local ones that run as a process (stdio), and remote ones (Streamable HTTP, falling back to SSE for older servers).
+
+```sh
+wisp mcp add fs -- npx -y @modelcontextprotocol/server-filesystem ~/code
+wisp mcp add github --env GITHUB_PERSONAL_ACCESS_TOKEN='${GITHUB_TOKEN}' -- npx -y @modelcontextprotocol/server-github
+wisp mcp add docs --url https://example.com/mcp --header 'Authorization: Bearer ${DOCS_TOKEN}'
+wisp mcp list            # connect to each server and show its status and tool count
+wisp mcp get fs          # list one server's tools
+wisp mcp remove fs
+```
+
+Servers live in `~/.wisp/mcp.json` (global), `.mcp.json` (project, shared with other tools), or `.wisp/mcp.json` (project, wisp only). They all use the standard `mcpServers` format, so configs from Claude Desktop, Cursor or Claude Code work as they are:
+
+```json
+{
+  "mcpServers": {
+    "fs": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/me/code"] },
+    "docs": { "url": "https://example.com/mcp", "headers": { "Authorization": "Bearer ${DOCS_TOKEN}" }, "autoApprove": ["search"] }
+  }
+}
+```
+
+- **Tool names:** each server's tools appear to the model as `mcp__<server>__<tool>` and show in the transcript as `server › tool`.
+- **Approvals:** every MCP tool call asks first and shows the full arguments. List tools in `autoApprove` (or use `"*"`) to skip the prompt for them.
+- **Results:** text, images and embedded resources go back to the model. A server's own usage instructions are added to the system prompt.
+- **Server options:** `${VAR}` and `${VAR:-default}` expand in commands, arguments, `env`, `url` and `headers`. Per-server options are `disabled`, `startupTimeout` (default 60s) and `timeout` per call (default 10 minutes).
+- **Project trust:** a repository's MCP config can launch any command, so wisp asks before starting project servers and asks again whenever that config changes. Print mode never asks; it skips untrusted project servers unless you pass `--trust-project`.
+- **In a session:** `/mcp` shows server status (with the server's error output if it failed), `/mcp tools [server]` lists tools, and `/mcp reconnect [server]` restarts one or all. The footer shows how many servers are connected.
+- **Flags:** `--no-mcp` disables MCP for one run, and `--mcp-config <file>` loads an extra config file.
+
 ## Models and providers
 
 | Provider | Needs | Notes |
@@ -155,8 +188,9 @@ The tools are `read_file` (text and images), `write_file`, `edit_file` (exact re
 ```
 src/
   index.ts            CLI flags, mode dispatch
-  core/               agent loop (events, steering, compaction), sessions, settings,
+  core/               agent loop (events, steering, compaction), sessions, settings, MCP client,
                       model catalog, context files/skills/templates, @mentions, export
+  mcp-cli.ts          `wisp mcp list|get|add|remove`
   providers/          anthropic.ts, openai.ts (also Ollama & compatible servers)
   tools/              files, bash, search, diff
   tui/                terminal + key/mouse parsing, fullscreen + inline renderers, editor,
@@ -169,6 +203,6 @@ test/                 node:test suites (no network)
 
 ```sh
 npm run dev -- -p "hello"   # run from source
-npm test                    # 33 tests, no API calls
+npm test                    # 36 tests, no API calls
 npm run typecheck
 ```
