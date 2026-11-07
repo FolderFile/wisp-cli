@@ -89,10 +89,10 @@ export const globTool: Tool<{ pattern: string; path?: string }> = {
       files.map(async (f) => ({ f, t: await stat(f).then((s) => s.mtimeMs, () => -1) })),
     );
     const existing = withTimes.filter((x) => x.t >= 0).sort((a, b) => b.t - a.t);
-    if (!existing.length) return 'No files matched.';
+    if (!existing.length) return { content: 'No files matched.', display: 'no files' };
     const shown = existing.slice(0, MAX_RESULTS).map((x) => displayPath(x.f, ctx.cwd));
     const more = existing.length > MAX_RESULTS ? `\n… and ${existing.length - MAX_RESULTS} more` : '';
-    return shown.join('\n') + more;
+    return { content: shown.join('\n') + more, display: `${existing.length} file${existing.length === 1 ? '' : 's'}` };
   },
 };
 
@@ -167,8 +167,10 @@ export const grepTool: Tool<GrepInput> = {
         if (results.length < MAX_RESULTS) results.push(rel);
       }
     }
-    if (!results.length) return 'No matches.';
+    if (!results.length) return { content: 'No matches.', display: 'no matches' };
     const more = total > results.length ? `\n… ${total - results.length} more matches not shown` : '';
-    return results.join('\n') + more;
+    const fileCount = new Set(results.map((r) => (files_only ? r : r.slice(0, r.indexOf(':'))))).size;
+    const display = files_only ? `${total} file${total === 1 ? '' : 's'}` : `${total} match${total === 1 ? '' : 'es'} in ${fileCount} file${fileCount === 1 ? '' : 's'}`;
+    return { content: results.join('\n') + more, display };
   },
 };

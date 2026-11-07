@@ -31,7 +31,7 @@ export const bashTool: Tool<{ command: string; timeout_ms?: number }> = {
   permission: 'exec',
   label: (i) => i.command,
   async preview({ command }) {
-    return `Run command:\n  ${command.split('\n').join('\n  ')}`;
+    return `$ ${command.split('\n').join('\n  ')}`;
   },
   run({ command, timeout_ms }, ctx) {
     const timeout = Math.min(Math.max(1000, timeout_ms ?? DEFAULT_TIMEOUT_MS), MAX_TIMEOUT_MS);

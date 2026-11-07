@@ -1,5 +1,6 @@
 import { AnthropicProvider } from '../providers/anthropic.js';
 import { OpenAIProvider } from '../providers/openai.js';
+import { credentialSource, savedApiKey, savedBaseURL } from './auth.js';
 import { DEFAULT_MODEL, PROVIDERS, modelInfo, type ModelInfo, type ProviderName } from './models.js';
 import type { Settings } from './settings.js';
 import type { Provider } from './types.js';
@@ -23,10 +24,43 @@ export function parseModelRef(s: string, fallbackProvider?: ProviderName): Model
 export const formatRef = (r: ModelRef) => `${r.provider}/${r.id}`;
 
 export function hasCredentials(p: ProviderName, s: Settings): boolean {
-  const ps = s.providers?.[p];
-  if (p === 'anthropic') return Boolean(ps?.apiKey || process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN);
-  if (p === 'openai') return Boolean(ps?.apiKey || process.env.OPENAI_API_KEY);
-  return true; // ollama: local, no key
+  if (p === 'ollama') return true; // local, no key
+  return credentialSource(p, s.providers?.[p]?.apiKey) !== null;
+}
+
+export function ollamaBaseURL(s: Settings): string {
+  return s.providers?.ollama?.baseURL ?? savedBaseURL('ollama') ?? process.env.OLLAMA_BASE_URL ?? 'http://localhost:11434/v1';
+}
+
+/** Is a local Ollama answering? (Short timeout: used at startup.) */
+export async function ollamaReachable(s: Settings, ms = 800): Promise<boolean> {
+  try {
+    const res = await fetch(ollamaBaseURL(s).replace(/\/v1\/?$/, '') + '/api/tags', { signal: AbortSignal.timeout(ms) });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/** Was a provider chosen on purpose (flag, env, settings) rather than guessed? */
+export function providerChosen(flags: { provider?: string; model?: string }, s: Settings): boolean {
+  return Boolean(flags.provider || flags.model || process.env.WISP_PROVIDER || process.env.WISP_MODEL || s.provider);
+}
+
+/** Stand-in used until a provider is set up (first run): every request explains how to fix it. */
+export class UnconfiguredProvider implements Provider {
+  readonly name = 'none';
+  readonly model = 'not set up';
+  async complete(): Promise<never> {
+    throw new NotConfiguredError();
+  }
+}
+
+export class NotConfiguredError extends Error {
+  constructor() {
+    super('No model is set up yet. Run /login to connect Anthropic, OpenAI or a local Ollama.');
+    this.name = 'NotConfiguredError';
+  }
 }
 
 /** Precedence: CLI flags > env vars > settings (project > global) > auto-detect. */
@@ -54,18 +88,16 @@ export function createProvider(ref: ModelRef, s: Settings): Provider {
   const ps = s.providers?.[ref.provider] ?? {};
   if (!hasCredentials(ref.provider, s)) {
     const v = ref.provider === 'anthropic' ? 'ANTHROPIC_API_KEY' : 'OPENAI_API_KEY';
-    throw new Error(`No credentials for ${ref.provider}: set ${v} or providers.${ref.provider}.apiKey in settings.`);
+    throw new Error(`No ${ref.provider} API key yet. Run /login in wisp, or set ${v}.`);
   }
+  const apiKey = ps.apiKey ?? savedApiKey(ref.provider);
   switch (ref.provider) {
     case 'anthropic':
-      return new AnthropicProvider(ref.id, { ...ps, fallbacks: s.anthropicFallbacks ?? false });
+      return new AnthropicProvider(ref.id, { apiKey, baseURL: ps.baseURL, fallbacks: s.anthropicFallbacks ?? false });
     case 'openai':
-      return new OpenAIProvider('openai', ref.id, ps);
+      return new OpenAIProvider('openai', ref.id, { apiKey, baseURL: ps.baseURL });
     case 'ollama':
-      return new OpenAIProvider('ollama', ref.id, {
-        apiKey: ps.apiKey ?? 'ollama',
-        baseURL: ps.baseURL ?? process.env.OLLAMA_BASE_URL ?? 'http://localhost:11434/v1',
-      });
+      return new OpenAIProvider('ollama', ref.id, { apiKey: apiKey ?? 'ollama', baseURL: ollamaBaseURL(s) });
   }
 }
 

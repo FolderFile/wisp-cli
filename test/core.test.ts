@@ -9,7 +9,7 @@ const home = await mkdtemp(join(tmpdir(), 'wisp-home-'));
 process.env.WISP_HOME = home;
 process.env.WISP_SESSION_DIR = join(home, 'sessions');
 
-const { Session, forkSession, listSessions, readEntries, restore, findSession } = await import('../src/core/session.ts');
+const { Session, forkSession, listSessions, readEntries, restore, findSession, buildTurnTree, countBranches } = await import('../src/core/session.ts');
 const { discoverContextFiles, discoverPromptTemplates, discoverSkills, expandTemplate, buildSystemPrompt } = await import('../src/core/context.ts');
 const { buildUserContent, droppedImagePath } = await import('../src/core/input.ts');
 const { parseModelRef, resolveModel } = await import('../src/core/config.ts');
@@ -38,9 +38,10 @@ test('sessions: lazy file creation, restore, list, find, fork, compaction', asyn
   assert.equal(state.messages.length, 4);
   assert.equal(state.model?.thinking, 'high');
 
-  const fork = forkSession(s.entries, cwd, 2, true);
-  const forked = restore(fork.entries);
-  assert.deepEqual(forked.messages.map((m: any) => m.content[0].text), ['first question', 'answer 1']);
+  const secondId = (s.entries.filter((e: any) => e.type === 'message')[2] as any).id;
+  const fork = forkSession(s.entries, cwd, true, secondId);
+  assert.deepEqual(restore(fork.entries).messages.map((m: any) => m.content[0].text), ['first question', 'answer 1']);
+  assert.equal(fork.name, 'my session');
   assert.equal(listSessions(cwd).length, 2);
 
   s.log({ type: 'compaction', summary: 'they asked two things', tokensBefore: 1000 });
@@ -48,6 +49,62 @@ test('sessions: lazy file creation, restore, list, find, fork, compaction', asyn
   const after = restore(readEntries(s.path!));
   assert.equal(after.messages.length, 2);
   assert.match(after.messages[0].content[0].text, /they asked two things/);
+});
+
+test('session tree: branch from an earlier turn, navigate, legacy files', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'wisp-tree-'));
+  const s = Session.create(cwd, { persist: true });
+  const say = (role: 'user' | 'assistant', text: string) => s.log({ type: 'message', message: msg(role, text) });
+  say('user', 'A');
+  say('assistant', 'a');
+  say('user', 'B');
+  say('assistant', 'b');
+
+  let tree = buildTurnTree(s.entries);
+  assert.equal(tree.length, 1);
+  const turnA = tree[0];
+  assert.equal(turnA.label, 'A');
+  assert.equal(turnA.children[0].label, 'B');
+  assert.ok(turnA.children[0].current);
+
+  // go back to the end of turn A and take a different path
+  s.moveHead(turnA.endId);
+  assert.deepEqual(restore(s.entries).messages.map((m: any) => m.content[0].text), ['A', 'a']);
+  say('user', 'C');
+  say('assistant', 'c');
+  tree = buildTurnTree(s.entries);
+  assert.deepEqual(tree[0].children.map((t: any) => [t.label, t.onPath, t.current]), [['B', false, false], ['C', true, true]]);
+  assert.equal(countBranches(tree), 1);
+
+  // "edit B": continue from just before B
+  const B = tree[0].children[0];
+  s.moveHead(B.parentId);
+  say('user', 'B2');
+  assert.deepEqual(buildTurnTree(s.entries)[0].children.map((t: any) => t.label), ['B', 'C', 'B2']);
+
+  // the file restores to the same branch
+  assert.deepEqual(restore(readEntries(s.path!)).messages.map((m: any) => m.content[0].text), ['A', 'a', 'B2']);
+  // forking copies only the active branch
+  assert.deepEqual(restore(forkSession(s.entries, cwd, false).entries).messages.map((m: any) => m.content[0].text), ['A', 'a', 'B2']);
+
+  // tool-result messages and replies belong to their turn, not new turns
+  const t = Session.create(cwd, { persist: false });
+  t.log({ type: 'message', message: msg('user', 'run it') });
+  t.log({ type: 'message', message: { role: 'assistant', content: [{ type: 'tool_call', id: 'x', name: 'ls', input: {} }] } as any });
+  t.log({ type: 'message', message: { role: 'user', content: [{ type: 'tool_result', id: 'x', content: 'ok' }] } as any });
+  t.log({ type: 'message', message: msg('assistant', 'done') });
+  const [turn] = buildTurnTree(t.entries);
+  assert.equal(turn.size, 4);
+  assert.equal(turn.children.length, 0);
+
+  // legacy (pre-branching) entries without ids read as a straight line
+  const legacy = [
+    { type: 'header', version: 1, id: 'old', cwd, created: '' },
+    { type: 'message', ts: '', message: msg('user', 'x') },
+    { type: 'message', ts: '', message: msg('assistant', 'y') },
+  ] as any[];
+  assert.equal(restore(legacy).messages.length, 2);
+  assert.equal(buildTurnTree(legacy)[0].size, 2);
 });
 
 test('context files, skills, prompt templates', async () => {

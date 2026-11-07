@@ -16,6 +16,7 @@ export class FullScreen {
   private source: () => string[] = () => [];
   private bottom: string[] = [];
   private cursor: { row: number; col: number } | null = null;
+  private overlay: { lines: string[]; cursor: { row: number; col: number } | null } | null = null;
   private scheduled = false;
   private lastFlush = 0;
   /** First transcript line shown; null = follow the end. */
@@ -44,11 +45,22 @@ export class FullScreen {
   }
 
   /** `transcript` is evaluated lazily, once per frame actually drawn. */
-  draw(transcript: () => string[], bottom: string[], cursor: { row: number; col: number } | null) {
+  draw(
+    transcript: () => string[],
+    bottom: string[],
+    cursor: { row: number; col: number } | null,
+    overlay: { lines: string[]; cursor: { row: number; col: number } | null } | null = null,
+  ) {
     this.source = transcript;
     this.bottom = bottom;
     this.cursor = cursor;
+    this.overlay = overlay;
     this.schedule();
+  }
+
+  /** Rows available above the bottom area (for sizing dialogs). */
+  viewportHeight(bottomRows: number) {
+    return Math.max(3, this.height - bottomRows);
   }
 
   scrollBy(lines: number) {
@@ -110,8 +122,11 @@ export class FullScreen {
     this.lastTop = top;
     this.lastMaxTop = maxTop;
 
+    // While the conversation is shorter than the screen, the input sits right
+    // under it (like a chat); once it fills the screen the input is pinned.
+    const float = !this.overlay && total < viewH;
     const view = this.transcript.slice(top, top + viewH);
-    while (view.length < viewH) view.push('');
+    if (!float) while (view.length < viewH) view.push('');
     const below = total - (top + viewH);
     if (this.scrollTop !== null && below > 0 && viewH > 0) {
       const label = ` ↓ ${below} more line${below === 1 ? '' : 's'} · scroll, PgDn or End to return `;
@@ -119,7 +134,20 @@ export class FullScreen {
       view[viewH - 1] = theme.border('─'.repeat(side)) + theme.accent(label) + theme.border('─'.repeat(Math.max(0, w - side - stringWidth(label))));
     }
 
+    // a floating dialog replaces the rows it covers, centered in the viewport
+    let overlayCursor: { row: number; col: number } | null = null;
+    if (this.overlay) {
+      const box = this.overlay.lines.slice(0, viewH);
+      const top = Math.max(0, Math.floor((viewH - box.length) / 2));
+      const boxW = Math.max(0, ...box.map((l) => stringWidth(l)));
+      const left = Math.max(0, Math.floor((w - boxW) / 2));
+      box.forEach((l, i) => (view[top + i] = ' '.repeat(left) + l));
+      if (this.overlay.cursor) overlayCursor = { row: top + this.overlay.cursor.row, col: left + this.overlay.cursor.col };
+    }
+
     const frame = [...view, ...bottom];
+    while (frame.length < rows) frame.push('');
+    const bottomTop = view.length;
     let out = '\x1b[?2026h\x1b[?25l';
     for (let i = 0; i < rows; i++) {
       const line = frame[i] ?? '';
@@ -129,7 +157,8 @@ export class FullScreen {
       out += `\x1b[${i + 1};1H\x1b[2K${fitted}\x1b[0m`;
     }
     this.prev = frame.slice(0, rows);
-    if (cursor) out += `\x1b[${viewH + cursor.row + 1};${Math.min(w, cursor.col + 1)}H\x1b[?25h`;
+    if (overlayCursor) out += `\x1b[${overlayCursor.row + 1};${Math.min(w, overlayCursor.col + 1)}H\x1b[?25h`;
+    else if (cursor && !this.overlay) out += `\x1b[${bottomTop + cursor.row + 1};${Math.min(w, cursor.col + 1)}H\x1b[?25h`;
     out += '\x1b[?2026l';
     this.term.write(out);
   }

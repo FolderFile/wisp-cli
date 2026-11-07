@@ -25,6 +25,8 @@ export type AgentEvent =
   | { type: 'assistant_message'; message: AssistantMessage; usage: Usage; stopReason: StopReason; stopDetail?: string }
   | { type: 'tool_start'; call: ToolCallBlock; label: string }
   | { type: 'tool_update'; id: string; partial: string }
+  | { type: 'tool_waiting'; id: string }
+  | { type: 'tool_approved'; id: string }
   | { type: 'tool_end'; call: ToolCallBlock; output: ToolOutput; isError: boolean; ms: number }
   | { type: 'steer'; text: string }
   | { type: 'message'; message: Message }
@@ -266,7 +268,7 @@ export class Agent {
       onUpdate: (partial) => this.emit({ type: 'tool_update', id: call.id, partial }),
     };
     try {
-      const approval = await this.checkPermission(tool, call.input, ctx);
+      const approval = await this.checkPermission(tool, call.input, ctx, call.id);
       if (approval === 'no')
         return finish({ content: 'The user denied this action. Do not retry it; wait for their instructions.' }, true, true);
       if (approval === 'unavailable')
@@ -279,7 +281,10 @@ export class Agent {
     }
   }
 
-  private async checkPermission(tool: Tool, input: any, ctx: ToolContext): Promise<Approval | 'unavailable'> {
+  private currentCallId = '';
+
+  private async checkPermission(tool: Tool, input: any, ctx: ToolContext, callId = ''): Promise<Approval | 'unavailable'> {
+    this.currentCallId = callId;
     const mode = this.opts.permissionMode;
     if (tool.permission === 'none' || mode === 'yolo') return 'yes';
     if (mode === 'auto-edit' && tool.permission === 'edit') return 'yes';
@@ -293,8 +298,10 @@ export class Agent {
       if (e instanceof ToolError) return 'yes';
       throw e;
     }
+    this.emit({ type: 'tool_waiting', id: this.currentCallId });
     const answer = await this.opts.approver(tool, input, preview, ctx.signal);
     if (answer === 'always') this.alwaysAllowed.add(tool.name);
+    if (answer !== 'no') this.emit({ type: 'tool_approved', id: this.currentCallId });
     return answer;
   }
 

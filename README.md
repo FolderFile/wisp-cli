@@ -39,7 +39,12 @@ ctx 3.1k/1M · ↑13k ↓598 · $0.029                 / commands · @ files · 
 npm install && npm run build && npm link   # puts `wisp` on your PATH
 ```
 
-Requires Node 22+. Set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`, or run Ollama locally.
+Requires Node 22+. The first time you run `wisp`, a setup dialog asks how to connect a model:
+
+- **Anthropic** or **OpenAI:** paste an API key. Wisp checks it, then saves it to `~/.wisp/auth.json`, which only you can read.
+- **Ollama:** wisp finds the models on your local Ollama.
+
+`ANTHROPIC_API_KEY` and `OPENAI_API_KEY` work too. Run `/login` any time to add or change a provider, and `/logout` to remove a saved key.
 
 ## Usage
 
@@ -68,6 +73,10 @@ Wisp runs **fullscreen** by default. It takes over the terminal's alternate scre
 
 Prefer your terminal's normal scrollback? Use `wisp --tui-mode inline`, or set `"tuiMode": "inline"` in settings. To keep fullscreen but leave the mouse alone, set `"mouse": false`.
 
+## Getting around
+
+Press `?` on an empty prompt for a help dialog that shows every shortcut and lets you search all commands. Pickers open as dialogs you can type into to search. That covers models (`ctrl+l`), conversations (`/resume`), thinking levels, permission modes and `/tree`. The bottom line of the screen always shows the keys that matter right now.
+
 ## In the editor
 
 | Key | |
@@ -95,14 +104,15 @@ Large pastes collapse into a `[Pasted #1 +120 lines]` placeholder. The full text
 
 ## Commands
 
-`/model`, `/thinking`, `/mode` (ask, auto-edit, yolo), `/new`, `/resume [all]`, `/fork`, `/name`, `/session`, `/compact [focus]`, `/copy`, `/export [file.html|file.md]`, `/reload`, `/settings` (opens `$EDITOR`, falling back to nano or vim, then reloads), `/mouse`, `/hotkeys`, `/help` and `/exit`. Prompt templates and skills also add commands (see below).
+`/help` (or `?`), `/model`, `/login`, `/logout`, `/tree`, `/thinking`, `/mode` (ask, auto-edit, yolo), `/new`, `/resume [all]`, `/fork`, `/name`, `/session`, `/compact [focus]`, `/copy`, `/export [file.html|file.md]`, `/reload`, `/settings` (opens `$EDITOR`, falling back to nano or vim, then reloads), `/mouse`, `/mcp` and `/exit`. Prompt templates and skills also add commands (see below).
 
 ## Sessions
 
-Every conversation is saved as an append-only JSONL file under `~/.wisp/sessions/<project>/`, so you can quit at any time.
+Every conversation is saved automatically as an append-only JSONL file under `~/.wisp/sessions/<project>/`, so you can quit at any time.
 
 - **Continue and resume:** `wisp -c` picks up the last session in this directory, and `wisp -r` or `/resume` opens a picker.
-- **Fork:** `/fork` branches from an earlier message into a new session. That message is placed in the editor so you can take the conversation a different way.
+- **Branches (`/tree`):** each conversation is a tree. `/tree` shows every message you've sent, with side branches indented under `├─`. Pick a point and press `enter` to carry on from there, or `e` to edit that message and resend it. Either way the new path becomes a branch, and nothing is deleted, so you can always switch back. Only the conversation moves; files on disk stay as they are.
+- **Fork:** `/fork` copies the current branch, or the part before a chosen message, into a separate new conversation.
 - **Compaction:** `/compact` summarizes the conversation to free context. Wisp also compacts automatically at 85% of the model's context window.
 - **Export:** `/export` writes the session as a standalone HTML page or as Markdown.
 
@@ -203,6 +213,6 @@ test/                 node:test suites (no network)
 
 ```sh
 npm run dev -- -p "hello"   # run from source
-npm test                    # 36 tests, no API calls
+npm test                    # 37 tests, no API calls
 npm run typecheck
 ```

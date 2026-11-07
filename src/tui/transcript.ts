@@ -64,7 +64,7 @@ export function renderToolBody(call: Pick<ToolCallBlock, 'name'>, output: ToolOu
 }
 
 export function renderUser(text: string, width: number): string[] {
-  const bar = theme.user('▌ ');
+  const bar = theme.user('┃ ');
   return wrap(text, width - 2).map((l) => bar + l);
 }
 
@@ -113,12 +113,25 @@ class StaticBlock extends Block {
   }
 }
 
+/** Re-renders from a function every time (e.g. the header, which shows the current model). */
+class LiveBlock extends Block {
+  constructor(private fn: () => string[]) {
+    super();
+  }
+  override lines(w: number): string[] {
+    return this.draw(w);
+  }
+  protected draw(w: number) {
+    return this.fn().flatMap((l) => wrap(l, w));
+  }
+}
+
 class UserBlock extends Block {
   constructor(private text: string, private steer = false) {
     super();
   }
   protected draw(w: number) {
-    if (this.steer) return [...wrap(this.text, w - 4).map((l, i) => theme.user(i === 0 ? '▌ ↳ ' : '▌   ') + l), ''];
+    if (this.steer) return [...wrap(this.text, w - 4).map((l, i) => theme.user(i === 0 ? '┃ ↳ ' : '┃   ') + l), ''];
     return ['', ...renderUser(this.text, w), ''];
   }
 }
@@ -202,6 +215,7 @@ class ThinkingBlock extends Block {
 
 class ToolBlock extends Block {
   status: ToolStatus = 'pending';
+  waiting = false;
   label = '';
   started = Date.now();
   ms = 0;
@@ -216,19 +230,24 @@ class ToolBlock extends Block {
   }
 
   protected depKey(ctx: RenderCtx) {
-    return `${ctx.verbose}|${this.status === 'running' ? ctx.frame : ''}`;
+    return `${ctx.verbose}|${this.status === 'running' ? ctx.frame : ''}|${this.waiting}`;
   }
 
   protected draw(w: number, ctx: RenderCtx) {
     const name = this.call.name;
     if (this.status === 'pending') return [toolHeader(name, theme.dim('preparing…'), 'pending', w)];
     if (this.status === 'running') {
-      const out = [toolHeader(name, this.label, 'running', w, formatDuration(Date.now() - this.started), ctx.frame)];
+      const out = [toolHeader(name, this.label, 'running', w, this.waiting ? 'waiting for you' : formatDuration(Date.now() - this.started), ctx.frame)];
       if (this.partial) out.push(...this.partial.trimEnd().split('\n').slice(-5).map((l) => '     ' + theme.dim(truncate(l, w - 6))));
       return out;
     }
     const extra = this.ms >= 1000 ? formatDuration(this.ms) : '';
-    return [toolHeader(name, this.label, this.status, w, extra), ...renderToolBody(this.call, this.output ?? { content: '' }, this.status === 'error', w, ctx.verbose)];
+    const out = this.output ?? { content: '' };
+    // a one-line summary ("6 lines", "12 matches") fits on the header line
+    if (this.status === 'ok' && !ctx.verbose && out.display && !out.display.includes('\n')) {
+      return [toolHeader(name, this.label, 'ok', w, `· ${stripAnsi(out.display)}${extra ? ` · ${extra}` : ''}`)];
+    }
+    return [toolHeader(name, this.label, this.status, w, extra), ...renderToolBody(this.call, out, this.status === 'error', w, ctx.verbose)];
   }
 }
 
@@ -268,6 +287,11 @@ export class Transcript {
 
   blank() {
     this.commit('');
+  }
+
+  /** Lines produced fresh on every render. */
+  live$(fn: () => string[]) {
+    this.add(new LiveBlock(fn));
   }
 
   user(text: string) {
@@ -333,6 +357,16 @@ export class Transcript {
         b.rev++;
         break;
       }
+      case 'tool_waiting':
+      case 'tool_approved': {
+        const b = this.tools.get(e.id);
+        if (b) {
+          b.waiting = e.type === 'tool_waiting';
+          if (!b.waiting) b.started = Date.now();
+          b.rev++;
+        }
+        break;
+      }
       case 'tool_update': {
         const b = this.tools.get(e.id);
         if (b) {
@@ -372,6 +406,18 @@ export class Transcript {
         this.tools.clear();
         break;
     }
+  }
+
+  /** Forget everything (switching conversation or branch). */
+  reset() {
+    this.blocks = [];
+    this.assistant = null;
+    this.thinking = null;
+    this.tools.clear();
+    this.committedIdx = 0;
+    this.lastToolOutput = null;
+    this.lastAssistantText = '';
+    this.version++;
   }
 
   /** Everything, rendered at width `w` (fullscreen view). */

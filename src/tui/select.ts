@@ -70,6 +70,28 @@ export class SelectList<T> {
     return 'handled';
   }
 
+  /** Just the option rows (for use inside a Dialog, which draws title and hints). */
+  renderRows(width: number, maxRows = 10): string[] {
+    const out: string[] = [];
+    if (!this.filtered.length) return [theme.dim(this.filter ? 'no matches' : 'nothing here yet')];
+    const count = this.filtered.length > maxRows;
+    const rows = count ? Math.max(1, maxRows - 1) : maxRows;
+    const start = Math.max(0, Math.min(this.index - Math.floor(rows / 2), this.filtered.length - rows));
+    const visible = this.filtered.slice(start, start + rows);
+    const detailW = Math.max(0, ...visible.map((o) => (o.detail ? stringWidth(o.detail) + 2 : 0)));
+    const maxLabel = Math.max(...visible.map((o) => stringWidth(o.label)), 4);
+    // labels get what the details leave, but never less than 60% of the row
+    const labelW = Math.min(maxLabel, Math.max(Math.floor(width * 0.6), width - detailW - 5));
+    visible.forEach((o, i) => {
+      const active = start + i === this.index;
+      const label = padEnd(truncate(o.label, labelW), labelW);
+      const detail = o.detail ? '  ' + theme.dim(truncate(o.detail, Math.max(4, width - labelW - 5))) : '';
+      out.push(truncate(active ? theme.accent('› ') + theme.selected(` ${label} `) + detail : `   ${label} ${detail}`, width));
+    });
+    if (count) out.push(theme.dim(`${this.index + 1} of ${this.filtered.length}`));
+    return out;
+  }
+
   render(width: number, maxRows = 10): string[] {
     const out: string[] = [];
     if (this.opts.title) {

@@ -3,7 +3,7 @@ import { existsSync, fstatSync, readFileSync } from 'node:fs';
 import { parseArgs } from 'node:util';
 import pc from 'picocolors';
 import { Agent } from './core/agent.js';
-import { availableModels, createProvider, getModelInfo, parseModelRef, resolveModel, type ModelRef } from './core/config.js';
+import { availableModels, createProvider, getModelInfo, ollamaReachable, parseModelRef, providerChosen, resolveModel, type ModelRef } from './core/config.js';
 import { buildSystemPrompt, discoverContextFiles, discoverSkills } from './core/context.js';
 import { describeError } from './core/errors.js';
 import { exportSession } from './core/export.js';
@@ -178,7 +178,7 @@ async function main(): Promise<number> {
     const info = findSession(f.fork, cwd);
     if (!info) throw new Error(`No session matches "${f.fork}".`);
     const entries = readEntries(info.path);
-    session = forkSession(entries, cwd, Number.MAX_SAFE_INTEGER, persist);
+    session = forkSession(entries, cwd, persist);
     restored = restore(session.entries);
   } else if (f.session) {
     const info = findSession(f.session, cwd);
@@ -216,6 +216,8 @@ async function main(): Promise<number> {
 
   if (nonInteractive) {
     if (!prompt.trim()) throw new Error('No prompt given. Usage: wisp -p "your prompt"');
+    if (ref.provider === 'ollama' && !providerChosen({ provider: f.provider, model: modelFlag }, settings) && !(await ollamaReachable(settings)))
+      throw new Error('No model is set up yet. Run `wisp` once and pick one (/login), or set ANTHROPIC_API_KEY or OPENAI_API_KEY.');
     const model = getModelInfo(ref, settings);
     const agent = new Agent({
       cwd,
@@ -288,6 +290,7 @@ async function main(): Promise<number> {
     mouse: settings.mouse ?? true,
     mcpServers,
     trustProjectMcp: Boolean(f['trust-project']),
+    autoProvider: !providerChosen({ provider: f.provider, model: modelFlag }, settings),
   });
   await app.run();
   await app.shutdown();
