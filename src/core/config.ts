@@ -1,6 +1,6 @@
 import { AnthropicProvider } from '../providers/anthropic.js';
 import { OpenAIProvider } from '../providers/openai.js';
-import { credentialSource, savedApiKey, savedBaseURL } from './auth.js';
+import { credentialSource, savedApiKey } from './auth.js';
 import { DEFAULT_MODEL, PROVIDERS, modelInfo, type ModelInfo, type ProviderName } from './models.js';
 import type { Settings } from './settings.js';
 import type { Provider } from './types.js';
@@ -25,11 +25,12 @@ export const formatRef = (r: ModelRef) => `${r.provider}/${r.id}`;
 
 export function hasCredentials(p: ProviderName, s: Settings): boolean {
   if (p === 'ollama') return true; // local, no key
-  return credentialSource(p, s.providers?.[p]?.apiKey) !== null;
+  return credentialSource(p) !== null;
 }
 
 export function ollamaBaseURL(s: Settings): string {
-  return s.providers?.ollama?.baseURL ?? savedBaseURL('ollama') ?? process.env.OLLAMA_BASE_URL ?? 'http://localhost:11434/v1';
+  // env > settings, like every other setting that has an env var
+  return process.env.OLLAMA_BASE_URL ?? s.providers?.ollama?.baseURL ?? 'http://localhost:11434/v1';
 }
 
 /** Is a local Ollama answering? (Short timeout: used at startup.) */
@@ -81,7 +82,7 @@ export function resolveModel(flags: { provider?: string; model?: string }, s: Se
 }
 
 export function getModelInfo(ref: ModelRef, s: Settings): ModelInfo {
-  return modelInfo(ref.provider, ref.id, s.models ?? []);
+  return modelInfo(ref.provider, ref.id, s.models);
 }
 
 export function createProvider(ref: ModelRef, s: Settings): Provider {
@@ -90,10 +91,11 @@ export function createProvider(ref: ModelRef, s: Settings): Provider {
     const v = ref.provider === 'anthropic' ? 'ANTHROPIC_API_KEY' : 'OPENAI_API_KEY';
     throw new Error(`No ${ref.provider} API key yet. Run /login in wisp, or set ${v}.`);
   }
-  const apiKey = ps.apiKey ?? savedApiKey(ref.provider);
+  // a saved /login key wins; otherwise the SDK reads the env var itself
+  const apiKey = savedApiKey(ref.provider);
   switch (ref.provider) {
     case 'anthropic':
-      return new AnthropicProvider(ref.id, { apiKey, baseURL: ps.baseURL, fallbacks: s.anthropicFallbacks ?? false });
+      return new AnthropicProvider(ref.id, { apiKey, baseURL: ps.baseURL });
     case 'openai':
       return new OpenAIProvider('openai', ref.id, { apiKey, baseURL: ps.baseURL });
     case 'ollama':
@@ -105,7 +107,7 @@ export function createProvider(ref: ModelRef, s: Settings): Provider {
 export function availableModels(s: Settings, builtins: ModelInfo[]): ModelInfo[] {
   const seen = new Set<string>();
   const out: ModelInfo[] = [];
-  for (const m of [...(s.models ?? []), ...builtins]) {
+  for (const m of [...s.models, ...builtins]) {
     const key = `${m.provider}/${m.id}`;
     if (seen.has(key) || !hasCredentials(m.provider, s)) continue;
     seen.add(key);

@@ -9,7 +9,6 @@ import { theme } from './theme.js';
 export interface CommandInfo {
   name: string;
   description: string;
-  args?: string;
 }
 
 interface Suggestion {
@@ -93,7 +92,7 @@ export class Autocomplete {
       const q = cmd[1];
       const list = this.commands();
       const matches = q ? fuzzyFilter(q, list, (c) => c.name, 30) : list;
-      this.set('command', before.length, matches.map((c) => ({ insert: `/${c.name} `, label: `/${c.name}${c.args ? ' ' + c.args : ''}`, detail: c.description })));
+      this.set('command', before.length, matches.map((c) => ({ insert: `/${c.name} `, label: `/${c.name}`, detail: c.description })));
       return;
     }
     const at = /(?:^|\s)@("[^"]*|[^\s]*)$/.exec(before);

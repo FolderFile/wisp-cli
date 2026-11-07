@@ -1,5 +1,4 @@
 import Anthropic from '@anthropic-ai/sdk';
-import { clampThinking, modelInfo } from '../core/models.js';
 import type {
   AssistantContent,
   CompletionRequest,
@@ -21,7 +20,7 @@ export class AnthropicProvider implements Provider {
   // apiKey / baseURL fall back to ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL inside the SDK.
   constructor(
     readonly model: string,
-    private opts: { apiKey?: string; baseURL?: string; fallbacks?: boolean } = {},
+    private opts: { apiKey?: string; baseURL?: string } = {},
   ) {
     this.client = new Anthropic({ apiKey: opts.apiKey, baseURL: opts.baseURL });
   }
@@ -44,7 +43,7 @@ export class AnthropicProvider implements Provider {
         eager_input_streaming: true,
       })),
       messages,
-      ...thinkingParams(this.model, req.thinking),
+      ...thinkingParams(req.thinking),
     };
 
     // Both stream flavours emit the same events; type them through a common shape.
@@ -53,14 +52,7 @@ export class AnthropicProvider implements Provider {
       on(event: 'streamEvent', fn: (ev: { type: string; content_block?: { type: string; id?: string; name?: string } }) => void): unknown;
       finalMessage(): Promise<unknown>;
     };
-    const stream = (
-      this.opts.fallbacks
-        ? this.client.beta.messages.stream(
-            { ...params, betas: ['server-side-fallback-2026-07-01'], fallbacks: 'default' } as unknown as Anthropic.Beta.Messages.MessageCreateParamsStreaming,
-            { signal: req.signal },
-          )
-        : this.client.messages.stream(params, { signal: req.signal })
-    ) as unknown as AnyStream;
+    const stream = this.client.messages.stream(params, { signal: req.signal }) as unknown as AnyStream;
 
     stream.on('text', (d) => handlers.onText(d));
     stream.on('thinking', (d) => handlers.onThinking(d));
@@ -124,9 +116,9 @@ function normalizeInput(input: unknown): Record<string, unknown> {
  * Most can't disable thinking at all, so "off" maps to the lowest effort unless
  * the model supports turning it off.
  */
-function thinkingParams(model: string, level: ThinkingLevel): Partial<Anthropic.MessageStreamParams> {
-  const info = modelInfo('anthropic', model);
-  const l = clampThinking(level, info);
+function thinkingParams(level: ThinkingLevel): Partial<Anthropic.MessageStreamParams> {
+  // the agent already clamped the level against the model's info (incl. custom models)
+  const l = level;
   if (l === 'off') return { thinking: { type: 'disabled' } };
   return {
     thinking: { type: 'adaptive', display: 'summarized' },

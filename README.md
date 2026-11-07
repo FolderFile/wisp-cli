@@ -9,6 +9,10 @@ A coding agent for your terminal that works with any provider. Wisp reads your c
 - **A model picker and thinking-level control**, plus a footer showing context use, tokens and cost.
 - **Project context files and extensions:** `AGENTS.md`/`CLAUDE.md`, skills, and prompt templates.
 - **MCP servers** over stdio, Streamable HTTP or SSE, using the `mcpServers` config format other tools already use.
+- **Checkpoints:** `/undo` and `/redo` put back the files a prompt changed, and `/tree` can restore files along with the conversation.
+- **Subagents, a todo list and code diagnostics:** the model can hand self-contained jobs to subagents, keep a checklist shown above the input, and see language-server errors right after each edit.
+
+Wisp has its own small engine: the agent loop, providers, tools, sessions and TUI are all in this repository. Its design borrows ideas from Pi and OpenCode.
 
 ```
 ▌ node test.js fails. Fix it.
@@ -71,7 +75,7 @@ Wisp runs **fullscreen** by default. It takes over the terminal's alternate scre
 - **Retroactive toggles:** `ctrl+o` (expand tool output) and `ctrl+t` (show thinking) apply to the whole conversation, not just new output.
 - **Selecting text:** while wisp captures the mouse, hold `shift` and drag to select. Or run `/mouse` to release the mouse entirely, then scroll with `PgUp`/`PgDn`.
 
-Prefer your terminal's normal scrollback? Use `wisp --tui-mode inline`, or set `"tuiMode": "inline"` in settings. To keep fullscreen but leave the mouse alone, set `"mouse": false`.
+To leave the mouse alone (and select text natively), turn off *Mouse wheel scrolling* in `/settings` or use `/mouse`.
 
 ## Getting around
 
@@ -104,14 +108,14 @@ Large pastes collapse into a `[Pasted #1 +120 lines]` placeholder. The full text
 
 ## Commands
 
-`/help` (or `?`), `/model`, `/login`, `/logout`, `/tree`, `/thinking`, `/mode` (ask, auto-edit, yolo), `/new`, `/resume [all]`, `/fork`, `/name`, `/session`, `/compact [focus]`, `/copy`, `/export [file.html|file.md]`, `/reload`, `/settings` (opens `$EDITOR`, falling back to nano or vim, then reloads), `/mouse`, `/mcp` and `/exit`. Prompt templates and skills also add commands (see below).
+`/help` (or `?`), `/model`, `/thinking`, `/settings`, `/login`, `/logout`, `/new`, `/resume` (tab toggles all folders), `/tree`, `/fork`, `/compact`, `/name`, `/session`, `/copy`, `/export` (defaults to `~/.wisp/exports/`), `/mcp`, `/reload`, `/mouse`, `/mode`, `/undo`, `/redo` and `/exit`. None needs an argument: each opens a picker or dialog. `/help`, `/model`, `/thinking`, `/settings`, `/name`, `/mode`, `/session`, `/copy`, `/export`, `/mcp` and `/tree` also work while wisp is busy. Prompt templates and skills also add commands (see below).
 
 ## Sessions
 
 Every conversation is saved automatically as an append-only JSONL file under `~/.wisp/sessions/<project>/`, so you can quit at any time.
 
 - **Continue and resume:** `wisp -c` picks up the last session in this directory, and `wisp -r` or `/resume` opens a picker.
-- **Branches (`/tree`):** each conversation is a tree. `/tree` shows every message you've sent, with side branches indented under `├─`. Pick a point and press `enter` to carry on from there, or `e` to edit that message and resend it. Either way the new path becomes a branch, and nothing is deleted, so you can always switch back. Only the conversation moves; files on disk stay as they are.
+- **Branches (`/tree`):** each conversation is a tree. `/tree` shows every message you've sent, with side branches indented under `├─`. Pick a point and press `enter` to carry on from there, or `e` to edit that message and resend it. Either way the new path becomes a branch, and nothing is deleted, so you can always switch back. When prompts on the way changed files, wisp offers to restore the files to that point too (see Checkpoints).
 - **Fork:** `/fork` copies the current branch, or the part before a chosen message, into a separate new conversation.
 - **Compaction:** `/compact` summarizes the conversation to free context. Wisp also compacts automatically at 85% of the model's context window.
 - **Export:** `/export` writes the session as a standalone HTML page or as Markdown.
@@ -164,22 +168,36 @@ Servers live in `~/.wisp/mcp.json` (global), `.mcp.json` (project, shared with o
 
 Thinking levels are `off`, `low`, `medium`, `high`, `xhigh` and `max`. Each model is limited to the levels it supports. For example, Claude Opus 5.5 always thinks, so `off` maps to `low`.
 
+## Checkpoints, subagents, todos, diagnostics
+
+Each of these is a feature in `src/features/` with an on/off row in `/settings` (keys `checkpoints`, `subagents`, `todo`, `lsp`; all on by default, applied live).
+
+- **Checkpoints:** before a prompt's first call that can change files (bash included), wisp snapshots the project into a shadow git repository under `~/.wisp/checkpoints/` (your own `.git` is never touched). `/undo` restores the files the last prompt changed and `/redo` brings them back; both work as stacks and follow the current `/tree` branch, and the model is told which files changed. Files over 2 MiB are not snapshotted. A prompt cut short by a crash can still be undone after `wisp -c`.
+- **Subagents:** the `subagent` tool runs a separate agent with a fresh context on one task and returns only its answer. `read` access (the default) gets read-only tools; `write` access also gets `edit_file`, `write_file` and `bash`, through the same permission mode and checkpoints. Up to 4 run in parallel, Esc stops them, and their cost is added to the session's. The transcript shows one line per subagent.
+- **Todo list:** the `todo` tool keeps a checklist for multi-step work, shown as one line above the input (`◐ 2/5 · current item`) until everything is done. It is rebuilt from the conversation when you resume or move with `/tree`.
+- **Code diagnostics:** after `edit_file` or `write_file`, wisp asks the file's language server (TypeScript, Python, Rust, Go, … whichever is installed) for errors and appends them to the result the model sees. Reading a file starts its server in the background.
+
 ## Settings
 
-`~/.wisp/settings.json` holds global settings and `.wisp/settings.json` holds project settings, which take precedence. Wisp remembers your last model, thinking level and mode.
+`/settings` lists every setting; Enter changes a value, applies it right away and saves it to `~/.wisp/settings.json`, and `p` saves it to the project's `.wisp/settings.json` instead. Project values win; when one overrides a change you made, wisp says so. Invalid values produce a warning and the default is used. Choosing a model (`/model`, ctrl+l) or thinking level (`/thinking`, shift+tab) makes it the default, and is recorded in the conversation: resuming restores that conversation's model and thinking without changing your defaults. `/mode` only affects the current run.
+
+API keys are not settings: they live in `~/.wisp/auth.json` (`/login`) or environment variables.
 
 ```json
 {
   "provider": "anthropic",
   "model": "claude-opus-5-5",
   "thinking": "high",
-  "permissionMode": "ask",
+  "permissionMode": "yolo",
   "favoriteModels": ["anthropic/claude-opus-5-5", "anthropic/claude-sonnet-5-5", "ollama/qwen3-coder"],
   "autoCompactAt": 0.85,
   "showThinking": true,
-  "tuiMode": "fullscreen",
   "mouse": true,
-  "anthropicFallbacks": false,
+  "quietStartup": false,
+  "checkpoints": true,
+  "subagents": true,
+  "todo": true,
+  "lsp": true,
   "providers": { "ollama": { "baseURL": "http://gpu-box:11434/v1" } },
   "models": [{ "provider": "ollama", "id": "qwen3-coder", "name": "Qwen3 Coder", "contextWindow": 262144, "maxOutput": 32768, "thinking": ["off"], "images": false }]
 }
@@ -189,7 +207,7 @@ Thinking levels are `off`, `low`, `medium`, `high`, `xhigh` and `max`. Each mode
 
 The tools are `read_file` (text and images), `write_file`, `edit_file` (exact replace, with a diff), `bash` (live output, timeout, killed on Esc), `grep`, `glob` and `ls`. Search respects `.gitignore`. Read-only tools run in parallel.
 
-- **Permission modes:** `ask` (the default) shows a diff or the command before running it. Answer **y**, **a** (always, for this session) or **n**. `auto-edit` lets file edits run without asking, and `yolo` approves everything.
+- **Permission modes:** `yolo` (the default) never asks. `ask` shows a diff or the command before running it; answer **y**, **a** (always, for this session) or **n**. `auto-edit` lets file edits run without asking. Set the default in `/settings`; `/mode`, `--permission`, `--auto-edit` and `-y` apply to one run.
 - **Edit safeguard:** edits are refused unless the model has read the file and the file hasn't changed on disk since that read.
 - **Denials:** if you deny a call, wisp stops and waits for you instead of retrying.
 
@@ -203,7 +221,13 @@ src/
   mcp-cli.ts          `wisp mcp list|get|add|remove`
   providers/          anthropic.ts, openai.ts (also Ollama & compatible servers)
   tools/              files, bash, search, diff
-  tui/                terminal + key/mouse parsing, fullscreen + inline renderers, editor,
+  features/           extensions built on core/hooks.ts (permissions, checkpoints, subagents,
+                      todo, lsp); registry in index.ts
+  checkpoints.ts      shadow-git snapshots and the undo/redo/tree history
+  subagent-runner.ts  in-process child agents
+  todo-state.ts       the todo tool and its widget
+  lsp/                JSON-RPC language-server client and manager
+  tui/                terminal + key/mouse parsing, fullscreen renderer, editor,
                       autocomplete, select lists, markdown + highlighting, transcript blocks, app
   modes/print.ts      --print / --json
 test/                 node:test suites (no network)
@@ -213,6 +237,6 @@ test/                 node:test suites (no network)
 
 ```sh
 npm run dev -- -p "hello"   # run from source
-npm test                    # 37 tests, no API calls
+npm test                    # no API calls
 npm run typecheck
 ```

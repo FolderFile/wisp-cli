@@ -3,8 +3,12 @@ import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { Agent, type AgentEvent, type Approval } from '../src/core/agent.ts';
+import { Agent, type AgentEvent } from '../src/core/agent.ts';
+import type { Feature, FeatureUI } from '../src/core/hooks.ts';
 import { modelInfo } from '../src/core/models.ts';
+import { SettingsStore, type PermissionMode } from '../src/core/settings.ts';
+import { permissionsFeature } from '../src/features/permissions.ts';
+import { installFeatures } from '../src/features/index.ts';
 import type { CompletionRequest, CompletionResult, Message, Provider } from '../src/core/types.ts';
 import { ALL_TOOLS } from '../src/tools/index.ts';
 
@@ -26,7 +30,25 @@ class FakeProvider implements Provider {
   }
 }
 
-async function setup(script: Script[], answer: Approval | null, extra: Partial<ConstructorParameters<typeof Agent>[0]> = {}) {
+type Approval = 'yes' | 'no' | 'always';
+
+function fakeUI(approver: (() => Promise<Approval>) | null): FeatureUI {
+  return {
+    interactive: approver !== null,
+    notice: () => {},
+    flash: () => {},
+    render: () => {},
+    height: 40,
+    select: (async () => (approver ? approver() : undefined)) as FeatureUI['select'],
+    input: async () => undefined,
+  };
+}
+
+async function setup(
+  script: Script[],
+  answer: Approval | null,
+  extra: Partial<ConstructorParameters<typeof Agent>[0]> & { approver?: () => Promise<Approval>; permissionMode?: PermissionMode; features?: Feature[] } = {},
+) {
   const cwd = await mkdtemp(join(tmpdir(), 'wisp-agent-'));
   await writeFile(join(cwd, 'app.js'), 'console.log("hello")\n');
   const provider = new FakeProvider(script);
@@ -37,10 +59,13 @@ async function setup(script: Script[], answer: Approval | null, extra: Partial<C
     tools: ALL_TOOLS,
     system: 'sys',
     thinking: 'medium',
-    permissionMode: 'ask',
-    approver: answer === null ? null : async () => answer,
     ...extra,
   });
+  const approver = extra.approver ?? (answer === null ? null : async () => answer);
+  installFeatures(
+    { cwd, agent, settings: new SettingsStore(cwd, { global: join(cwd, 'g.json'), project: join(cwd, 'p.json') }), ui: fakeUI(approver), session: () => null as any, refreshTools: () => agent.refreshTools() },
+    [permissionsFeature(extra.permissionMode ?? 'ask'), ...(extra.features ?? [])],
+  );
   const events: AgentEvent[] = [];
   agent.subscribe((e) => events.push(e));
   return { cwd, provider, agent, events };
@@ -178,4 +203,73 @@ test('compaction replaces history with a summary; auto-compacts near the context
   const sent = provider.seen[2];
   assert.match((sent[0].content[0] as any).text, /SUMMARY: user wants X/);
   assert.equal((sent.at(-1)!.content[0] as any).text, 'Continue with the task where you left off.');
+});
+
+test('feature hooks: beforeToolCall rewrites or blocks, afterToolResult appends, turn hooks and feature tools', async () => {
+  const seen: string[] = [];
+  const feature: Feature = {
+    name: 'test',
+    tools: () => [{ name: 'ping', description: 'ping', inputSchema: { type: 'object', properties: {} }, permission: 'none', label: () => 'ping', run: async () => 'pong' }],
+    turnStart: () => void seen.push('start'),
+    turnEnd: (i) => void seen.push(`end:${i.aborted}`),
+    beforeToolCall(call) {
+      if (call.name === 'bash') return { block: 'no shell here' };
+      if (call.name === 'read_file') return { input: { path: 'app.js' } };
+    },
+    afterToolResult(call, r) {
+      if (call.name === 'ping') return { append: `took ${typeof r.ms}` };
+    },
+  };
+  const { agent } = await setup(
+    [[
+      { type: 'tool_call', id: 'r', name: 'read_file', input: { path: 'missing.js' } },
+      { type: 'tool_call', id: 'p', name: 'ping', input: {} },
+      { type: 'tool_call', id: 'b', name: 'bash', input: { command: 'echo hi' } },
+    ]],
+    'yes',
+    { features: [feature], permissionMode: 'yolo' },
+  );
+  assert.ok(agent.tools.some((t) => t.name === 'ping'));
+  await agent.run(user('go'), new AbortController().signal);
+  const results = agent.messages[2].content as any[];
+  assert.match(results[0].content, /hello/, 'input was rewritten to app.js');
+  assert.equal(results[1].content, 'pong\n\ntook number');
+  assert.equal(results[2].content, 'no shell here');
+  assert.equal(results[2].isError, true);
+  assert.deepEqual(seen, ['start', 'end:false']);
+});
+
+test('settings: validated, project wins and is reported, values persist and apply live', async () => {
+  const { mkdtemp: mk, writeFile: wf, readFile: rf } = await import('node:fs/promises');
+  const dir = await mk(join(tmpdir(), 'wisp-settings-'));
+  const paths = { global: join(dir, 'global.json'), project: join(dir, 'project.json') };
+  await wf(paths.global, JSON.stringify({ autoCompactAt: 'abc', thinking: 'low', mouse: false, providers: { anthropic: { apiKey: 'sk-x' } } }));
+  await wf(paths.project, JSON.stringify({ thinking: 'high' }));
+  const st = new SettingsStore(dir, paths);
+  assert.equal(st.get('autoCompactAt'), 0.85, 'bad value falls back to the default');
+  assert.equal(st.get('thinking'), 'high');
+  assert.equal(st.get('mouse'), false);
+  assert.deepEqual(st.get('providers'), {}, 'API keys in settings are rejected');
+  const warnings = st.takeWarnings();
+  assert.equal(warnings.length, 2);
+  assert.ok(warnings.some((w) => /auth\.json/.test(w)));
+  assert.equal(st.takeWarnings().length, 0, 'each warning once');
+
+  let applied: unknown;
+  st.onApply('mouse', (v) => (applied = v));
+  assert.deepEqual(st.set('mouse', true), { saved: true, overridden: false, error: undefined });
+  assert.equal(applied, true);
+  assert.equal(JSON.parse(await rf(paths.global, 'utf8')).mouse, true);
+  assert.equal(st.set('thinking', 'off').overridden, true, 'project value still wins');
+  assert.equal(st.get('thinking'), 'high');
+  st.set('thinking', 'off', 'project');
+  assert.equal(st.get('thinking'), 'off');
+  assert.ok(st.set('mouse', 'yes').error, 'invalid values are refused');
+
+  // a broken file is never overwritten
+  await wf(paths.project, '{ nope');
+  st.reload();
+  assert.match(st.takeWarnings()[0], /not valid JSON/);
+  assert.ok(st.set('quietStartup', true, 'project').error);
+  assert.equal(await rf(paths.project, 'utf8'), '{ nope');
 });

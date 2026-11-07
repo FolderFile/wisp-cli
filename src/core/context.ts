@@ -172,11 +172,12 @@ export function buildSystemPrompt(p: SystemPromptParts): string {
   const base = p.override ?? sysFile ?? DEFAULT_SYSTEM_PROMPT;
   const sections = [base.trim()];
 
+  const env = sessionEnv(p.cwd);
   sections.push(`# Environment
 - Working directory: ${p.cwd}
 - Platform: ${process.platform}
-- Git repository: ${gitInfo(p.cwd)}
-- Today's date: ${new Date().toISOString().slice(0, 10)}
+- Git repository: ${env.git}
+- Today's date: ${env.date}
 - Available tools: ${describeTools(p.tools)}`);
 
   if (p.mcpInstructions?.length) {
@@ -203,6 +204,18 @@ export function buildSystemPrompt(p: SystemPromptParts): string {
   const appendFile = readIf(join(p.cwd, '.wisp', 'APPEND_SYSTEM.md')) ?? readIf(join(AGENT_DIR, 'APPEND_SYSTEM.md'));
   for (const extra of [appendFile, ...(p.append ?? [])]) if (extra?.trim()) sections.push(extra.trim());
   return sections.join('\n\n');
+}
+
+const envCache = new Map<string, { git: string; date: string }>();
+
+/**
+ * Date and git info are captured once per process, so rebuilding the prompt
+ * (MCP tools changing, /reload) keeps it byte-identical and the prompt cache warm.
+ */
+function sessionEnv(cwd: string) {
+  let e = envCache.get(cwd);
+  if (!e) envCache.set(cwd, (e = { git: gitInfo(cwd), date: new Date().toISOString().slice(0, 10) }));
+  return e;
 }
 
 /** Built-in tools by name; MCP tools summarized per server (there can be dozens). */

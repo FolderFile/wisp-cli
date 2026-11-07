@@ -91,7 +91,7 @@ export function maskKey(v: string): string {
 }
 
 export interface DialogKey<T> {
-  /** Key name as typed, e.g. "e" or "d". */
+  /** Key as typed, e.g. "e", or a key name such as "tab". */
   key: string;
   label: string;
   /** Return true to keep the dialog open. */
@@ -146,6 +146,9 @@ export class Dialog<T = unknown> {
       if (this.o.input.handleKey(k) && this.status?.kind === 'error') this.status = null;
       return 'keep';
     }
+    // named-key actions (e.g. "tab")
+    const named = this.o.keys?.find((a) => a.key.length > 1 && a.key === k.name && !k.ctrl && !k.alt);
+    if (named) return named.run(this.o.list?.selected?.value) ? 'keep' : 'close';
     // extra single-key actions (unless the list is being filtered by typing)
     if (k.text && !k.ctrl && !k.alt && this.o.keys?.length && !(this.o.list?.opts.filterable && this.o.list.filter)) {
       const action = this.o.keys.find((a) => a.key === k.text!.toLowerCase());

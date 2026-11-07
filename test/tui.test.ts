@@ -194,3 +194,21 @@ test('fullscreen: the input stays pinned to the bottom even when the conversatio
   assert.match(written, /\x1b\[9;1H\x1b\[2K─ border/, 'bottom area starts at row 9 of 12');
   assert.match(written, /\x1b\[10;3H/, 'cursor on the input row');
 });
+
+test('replay shows what the user typed, not the contents of attached files', async () => {
+  const { Transcript } = await import('../src/tui/transcript.ts');
+  const t = new Transcript({ showThinking: () => true, verbose: () => false });
+  t.replay([
+    {
+      role: 'user',
+      content: [
+        { type: 'text', text: 'explain @src/a.ts' },
+        { type: 'text', text: '<file path="src/a.ts">\nSECRET_FILE_BODY\n</file>' },
+      ],
+    },
+  ]);
+  const out = t.render(80).map(strip).join('\n');
+  assert.match(out, /explain @src\/a\.ts/);
+  assert.match(out, /attached src\/a\.ts/);
+  assert.doesNotMatch(out, /SECRET_FILE_BODY/);
+});

@@ -25,7 +25,9 @@ export type SessionEntry =
   | { type: 'head'; ts: string; id: string | null }
   | { type: 'name'; ts: string; name: string }
   | { type: 'model'; ts: string; provider: string; model: string; thinking: ThinkingLevel }
-  | { type: 'usage'; ts: string; usage: Usage; costUSD: number; contextUsed: number };
+  | { type: 'usage'; ts: string; usage: Usage; costUSD: number; contextUsed: number }
+  /** Feature data (e.g. checkpoints), attached to the node that was the head (`at`) when it was logged. Not part of the conversation. */
+  | { type: 'custom'; ts: string; id: string; customType: string; data: unknown; at: string | null };
 
 type NodeEntry = Extract<SessionEntry, { type: 'message' | 'compaction' }> & { id: string; parent: string | null };
 
@@ -149,6 +151,13 @@ export class Session {
     this.append({ ...entry, ts: new Date().toISOString() } as SessionEntry);
   }
 
+  /** Log feature data at the current head; returns the entry's id. */
+  custom(customType: string, data: unknown): string {
+    const id = newId();
+    this.log({ type: 'custom', id, customType, data, at: this.head });
+    return id;
+  }
+
   /** Make `id` the head: the next message continues from there (a new branch). */
   moveHead(id: string | null) {
     if (id === this.head) return;
@@ -205,11 +214,24 @@ export function restore(entries: SessionEntry[]): RestoredState {
 export function firstUserText(m: Message | undefined): string {
   if (!m || m.role !== 'user') return '';
   return m.content
-    .filter((b) => b.type === 'text')
-    .map((b) => b.text)
+    .filter((b) => b.type === 'text' && !b.text.startsWith('<wisp-note>'))
+    .map((b) => (b as { text: string }).text)
     .join(' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+/**
+ * The entries on the branch ending at `leaf` (default: the head), root first: each node
+ * followed by the custom entries logged while it was the head.
+ */
+export function branchEntries(entries: SessionEntry[], leaf?: string | null): Array<NodeEntry | Extract<SessionEntry, { type: 'custom' }>> {
+  const { byId, head } = linkNodes(entries);
+  const customs = new Map<string | null, Extract<SessionEntry, { type: 'custom' }>[]>();
+  for (const e of entries) if (e.type === 'custom') customs.set(e.at, [...(customs.get(e.at) ?? []), e]);
+  const out: Array<NodeEntry | Extract<SessionEntry, { type: 'custom' }>> = [...(customs.get(null) ?? [])];
+  for (const n of pathTo(leaf === undefined ? head : leaf, byId)) out.push(n, ...(customs.get(n.id) ?? []));
+  return out;
 }
 
 // --- tree view ------------------------------------------------------------------
@@ -274,7 +296,7 @@ export function buildTurnTree(entries: SessionEntry[]): TurnNode[] {
     const fullText =
       n.type === 'message'
         ? n.message.content
-            .filter((b) => b.type === 'text')
+            .filter((b) => b.type === 'text' && !b.text.startsWith('<wisp-note>'))
             .map((b) => (b as { text: string }).text)
             .join('\n')
         : text;
@@ -372,4 +394,15 @@ export function forkSession(entries: SessionEntry[], cwd: string, persist: boole
   if (model) fork.append(model);
   for (const n of path) fork.append({ ...n, id: undefined, parent: undefined } as SessionEntry);
   return fork;
+}
+
+/** Record what the agent did (messages, usage, compactions). Shared by the TUI and print mode. */
+export function logAgentEvent(session: Session, agent: { usage: import('./types.js').Usage; costUSD: number; contextUsed: number }, e: { type: string; message?: Message; summary?: string; tokensBefore?: number }) {
+  if (e.type === 'message' && e.message) {
+    session.log({ type: 'message', message: e.message });
+    if (e.message.role === 'assistant') session.log({ type: 'usage', usage: agent.usage, costUSD: agent.costUSD, contextUsed: agent.contextUsed });
+  } else if (e.type === 'compaction_end') {
+    session.log({ type: 'compaction', summary: e.summary!, tokensBefore: e.tokensBefore! });
+    session.log({ type: 'usage', usage: agent.usage, costUSD: agent.costUSD, contextUsed: 0 });
+  }
 }

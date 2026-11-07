@@ -2,7 +2,8 @@ import pc from 'picocolors';
 import { Agent, type AgentEvent } from '../core/agent.js';
 import { describeError, isAbortError } from '../core/errors.js';
 import { buildUserContent } from '../core/input.js';
-import type { Session } from '../core/session.js';
+import type { FeatureUI } from '../core/hooks.js';
+import { logAgentEvent, type Session } from '../core/session.js';
 import { toolTitle } from '../tui/transcript.js';
 
 /**
@@ -17,15 +18,10 @@ export async function runPrint(agent: Agent, session: Session, prompt: string, c
   let atLineStart = true;
 
   agent.subscribe((e: AgentEvent) => {
-    if (e.type === 'message') {
-      session.log({ type: 'message', message: e.message });
-      if (e.message.role === 'assistant')
-        session.log({ type: 'usage', usage: agent.usage, costUSD: agent.costUSD, contextUsed: agent.contextUsed });
-    }
-    if (e.type === 'compaction_end') session.log({ type: 'compaction', summary: e.summary, tokensBefore: e.tokensBefore });
+    logAgentEvent(session, agent, e);
 
     if (mode === 'json') {
-      const ev = e.type === 'turn_end' && e.error ? { ...e, error: describeError(e.error) } : e;
+      const ev = e.type === 'turn_end' && e.error ? { ...e, error: describeError(e.error, { provider: agent.opts.model.provider }) } : e;
       out.write(JSON.stringify(ev) + '\n');
       return;
     }
@@ -61,3 +57,14 @@ export async function runPrint(agent: Agent, session: Session, prompt: string, c
     return 1;
   }
 }
+
+/** Feature UI for print/json mode: notices go to stderr, dialogs resolve to undefined. */
+export const printUI: FeatureUI = {
+  interactive: false,
+  notice: (text, kind) => process.stderr.write((kind === 'error' ? pc.red(text) : kind === 'warn' ? pc.yellow(text) : text) + '\n'),
+  flash: () => {},
+  select: async () => undefined,
+  input: async () => undefined,
+  render: () => {},
+  height: 24,
+};

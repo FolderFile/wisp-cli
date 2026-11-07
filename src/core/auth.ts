@@ -7,13 +7,14 @@ import { AGENT_DIR } from './settings.js';
 
 /**
  * API keys saved with /login live in ~/.wisp/auth.json (readable only by you).
- * Lookup order: settings.providers.<p>.apiKey → auth.json → environment.
+ * This and the environment are the only credential sources (settings.json holds no keys).
+ * Lookup order: auth.json → environment.
  * A key saved with /login wins over the environment because it is the more
  * deliberate choice; /logout removes it again.
  */
 export const AUTH_FILE = join(AGENT_DIR, 'auth.json');
 
-type AuthFile = Partial<Record<ProviderName, { apiKey?: string; baseURL?: string; savedAt?: string }>>;
+type AuthFile = Partial<Record<ProviderName, { apiKey?: string; savedAt?: string }>>;
 
 export function readAuth(): AuthFile {
   try {
@@ -29,7 +30,7 @@ function writeAuth(a: AuthFile) {
   chmodSync(AUTH_FILE, 0o600);
 }
 
-export function saveCredential(p: ProviderName, cred: { apiKey?: string; baseURL?: string }) {
+export function saveCredential(p: ProviderName, cred: { apiKey?: string }) {
   const a = readAuth();
   a[p] = { ...cred, savedAt: new Date().toISOString() };
   writeAuth(a);
@@ -46,8 +47,7 @@ export function removeCredential(p: ProviderName): boolean {
 export const ENV_KEYS: Partial<Record<ProviderName, string>> = { anthropic: 'ANTHROPIC_API_KEY', openai: 'OPENAI_API_KEY' };
 
 /** Where a provider's credentials come from, if anywhere. */
-export function credentialSource(p: ProviderName, settingsKey?: string): 'settings' | 'login' | 'env' | null {
-  if (settingsKey) return 'settings';
+export function credentialSource(p: ProviderName): 'login' | 'env' | null {
   if (readAuth()[p]?.apiKey) return 'login';
   const env = ENV_KEYS[p];
   if (env && process.env[env]) return 'env';
@@ -57,10 +57,6 @@ export function credentialSource(p: ProviderName, settingsKey?: string): 'settin
 
 export function savedApiKey(p: ProviderName): string | undefined {
   return readAuth()[p]?.apiKey;
-}
-
-export function savedBaseURL(p: ProviderName): string | undefined {
-  return readAuth()[p]?.baseURL;
 }
 
 /** Check a key by listing models. Resolves to the model ids, or throws a readable error. */

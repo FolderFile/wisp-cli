@@ -10,9 +10,10 @@ import { exportSession } from './core/export.js';
 import { isProjectTrusted, loadMcpConfig, McpManager } from './core/mcp.js';
 import { BUILTIN_MODELS, PROVIDERS } from './core/models.js';
 import { findSession, forkSession, listSessions, readEntries, restore, Session, type RestoredState } from './core/session.js';
-import { GLOBAL_SETTINGS, PERMISSION_MODES, SettingsStore, type PermissionMode } from './core/settings.js';
+import { PERMISSION_MODES, SettingsStore, type PermissionMode } from './core/settings.js';
 import { THINKING_LEVELS, type ThinkingLevel } from './core/types.js';
-import { runPrint } from './modes/print.js';
+import { builtinFeatures, installFeatures, shutdownFeatures } from './features/index.js';
+import { printUI, runPrint } from './modes/print.js';
 import { selectTools } from './tools/index.js';
 
 const VERSION: string = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
@@ -40,17 +41,16 @@ ${pc.bold('Sessions')}
   --fork <id|path>             start a new session branched from another one
   -n, --name <name>            name the session
   --no-session                 don't save this session
-  --export <id|path> [out]     export a session to HTML (or .md) and exit
+  --export <id|path>           export a session to HTML and exit (--out <file> to choose the path)
 
 ${pc.bold('Behaviour')}
-  --auto-edit                  approve file edits automatically; still ask before commands
-  -y, --yes                    approve everything (use in a sandbox)
-  --permission <mode>          ${PERMISSION_MODES.join(' | ')}
+  --auto-edit                  edit files freely; ask before commands
+  -y, --yes                    never ask (the default, unless settings say otherwise)
+  --permission <mode>          ${PERMISSION_MODES.join(' | ')} (for this run)
   -t, --tools <list>           tools to enable, e.g. read_file,grep or +ls,-bash
   --system-prompt <text|file>  replace the system prompt
   --append-system-prompt <t>   append to the system prompt (repeatable)
   --no-context-files           don't load AGENTS.md / CLAUDE.md
-  --tui-mode <mode>            fullscreen (default: own screen, scrollable) | inline (normal scrollback)
   --no-mcp                     don't start MCP servers
   --mcp-config <file>          load MCP servers from this file too (repeatable)
   --trust-project              start this project's MCP servers without asking
@@ -110,6 +110,7 @@ async function main(): Promise<number> {
       name: { type: 'string', short: 'n' },
       'no-session': { type: 'boolean' },
       export: { type: 'string' },
+      out: { type: 'string' },
       'auto-edit': { type: 'boolean' },
       yes: { type: 'boolean', short: 'y' },
       permission: { type: 'string' },
@@ -117,7 +118,6 @@ async function main(): Promise<number> {
       'system-prompt': { type: 'string' },
       'append-system-prompt': { type: 'string', multiple: true },
       'no-context-files': { type: 'boolean' },
-      'tui-mode': { type: 'string' },
       'no-mcp': { type: 'boolean' },
       'mcp-config': { type: 'string', multiple: true },
       'trust-project': { type: 'boolean' },
@@ -131,11 +131,14 @@ async function main(): Promise<number> {
   const cwd = process.cwd();
   const store = new SettingsStore(cwd);
   const settings = store.merged;
+  const nonInteractive = f.print || f.json || !process.stdin.isTTY || !process.stdout.isTTY;
+  // in the TUI the warnings are shown as notices instead
+  if (nonInteractive || f.export || f['list-models']) for (const w of store.takeWarnings()) process.stderr.write(pc.yellow(`warning: ${w}\n`));
 
   if (f.export) {
     const info = findSession(f.export, cwd);
     if (!info) throw new Error(`No session matches "${f.export}".`);
-    const out = positionals[0] ?? `wisp-${info.id}.html`;
+    const out = f.out ?? positionals[0] ?? `wisp-${info.id}.html`;
     exportSession(out, restore(readEntries(info.path)).messages, info.name ?? `wisp session ${info.id}`);
     console.log(`Exported to ${out}`);
     return 0;
@@ -143,7 +146,7 @@ async function main(): Promise<number> {
 
   // model + thinking (a ":level" suffix on the model sets thinking)
   let modelFlag = f.model;
-  let thinking: ThinkingLevel = (f.thinking as ThinkingLevel) ?? settings.thinking ?? 'medium';
+  let thinking: ThinkingLevel = (f.thinking as ThinkingLevel) ?? settings.thinking;
   const suffix = modelFlag && /:(off|low|medium|high|xhigh|max)$/.exec(modelFlag);
   if (suffix && modelFlag) {
     if (!f.thinking) thinking = suffix[1] as ThinkingLevel;
@@ -159,7 +162,7 @@ async function main(): Promise<number> {
     return 0;
   }
 
-  const permission: PermissionMode = f.yes ? 'yolo' : f['auto-edit'] ? 'auto-edit' : ((f.permission as PermissionMode) ?? settings.permissionMode ?? 'ask');
+  const permission: PermissionMode = f.yes ? 'yolo' : f['auto-edit'] ? 'auto-edit' : ((f.permission as PermissionMode) ?? settings.permissionMode);
   if (!PERMISSION_MODES.includes(permission)) throw new Error(`Unknown permission mode "${permission}".`);
   const tools = selectTools(f.tools);
   const persist = !f['no-session'];
@@ -188,10 +191,6 @@ async function main(): Promise<number> {
     const last = listSessions(cwd)[0];
     if (last) openExisting(last.path);
     else session = Session.create(cwd, { persist });
-  } else if (f.resume) {
-    const picked = await pickSession(cwd);
-    if (!picked) return 0;
-    openExisting(picked);
   } else session = Session.create(cwd, { persist });
   session = session!;
   if (f.name) session.log({ type: 'name', name: f.name });
@@ -204,7 +203,6 @@ async function main(): Promise<number> {
 
   // --- prompt -------------------------------------------------------------------
   let prompt = positionals.join(' ');
-  const nonInteractive = f.print || f.json || !process.stdin.isTTY || !process.stdout.isTTY;
   if (shouldReadStdin(Boolean(prompt))) {
     const piped = (await readStdin()).trim();
     if (piped) prompt = [prompt, piped].filter(Boolean).join('\n\n');
@@ -232,13 +230,18 @@ async function main(): Promise<number> {
         override: systemOverride,
         append: appendSystem,
       }),
-      maxTokens: settings.maxTokens,
       thinking,
-      permissionMode: permission,
-      approver: null,
       autoCompactAt: settings.autoCompactAt,
     });
+    installFeatures(
+      { cwd, agent, settings: store, ui: printUI, session: () => session, refreshTools: () => agent.refreshTools() },
+      builtinFeatures({ permissionMode: permission }),
+    );
     if (restored) agent.load(restored.messages, restored);
+    for (const feat of agent.features)
+      try {
+        feat.sessionLoaded?.({ session, reason: restored ? 'resume' : 'startup' });
+      } catch {}
     // MCP: no one to ask here, so untrusted project servers are skipped
     let mcp: McpManager | null = null;
     if (mcpServers.length) {
@@ -265,12 +268,10 @@ async function main(): Promise<number> {
     try {
       return await runPrint(agent, session, prompt, cwd, f.json ? 'json' : 'text');
     } finally {
-      await mcp?.close();
+      await Promise.all([mcp?.close(), shutdownFeatures(agent.features)]);
     }
   }
 
-  const tuiMode = (f['tui-mode'] ?? process.env.WISP_TUI_MODE ?? settings.tuiMode ?? 'fullscreen') as 'fullscreen' | 'inline';
-  if (tuiMode !== 'fullscreen' && tuiMode !== 'inline') throw new Error(`Unknown --tui-mode "${tuiMode}". Use fullscreen or inline.`);
   const { App } = await import('./tui/app.js');
   const app = new App({
     cwd,
@@ -286,8 +287,7 @@ async function main(): Promise<number> {
     restored,
     initialPrompt: prompt || undefined,
     persistSessions: persist,
-    tuiMode,
-    mouse: settings.mouse ?? true,
+    openResume: Boolean(f.resume),
     mcpServers,
     trustProjectMcp: Boolean(f['trust-project']),
     autoProvider: !providerChosen({ provider: f.provider, model: modelFlag }, settings),
@@ -297,41 +297,9 @@ async function main(): Promise<number> {
   return 0;
 }
 
-/** Minimal pre-TUI session picker for --resume. */
-async function pickSession(cwd: string): Promise<string | null> {
-  const sessions = listSessions(cwd);
-  if (!sessions.length) {
-    console.log('No saved sessions for this directory.');
-    return null;
-  }
-  const { Terminal } = await import('./tui/terminal.js');
-  const { Screen } = await import('./tui/screen.js');
-  const { SelectList } = await import('./tui/select.js');
-  const term = new Terminal();
-  const screen = new Screen(term);
-  const list = new SelectList(
-    sessions.map((s) => ({ label: (s.name ?? s.firstMessage).slice(0, 70), keywords: s.firstMessage, detail: `${s.modified.toLocaleString()} · ${s.messageCount} msgs`, value: s.path })),
-    { title: 'Resume session', filterable: true },
-  );
-  return new Promise((resolve) => {
-    const draw = () => screen.setLive(list.render(screen.width, Math.min(15, screen.height - 4)), null);
-    term.start((e) => {
-      if (e.type !== 'key') return;
-      const r = list.handleKey(e.key);
-      if (r === 'select' || r === 'cancel') {
-        screen.close();
-        term.stop();
-        resolve(r === 'select' ? list.selected!.value : null);
-      } else draw();
-    }, draw);
-    draw();
-  });
-}
-
 main()
   .then((code) => process.exit(code))
   .catch((err) => {
     process.stderr.write(pc.red(describeError(err)) + '\n');
-    if (String((err as Error)?.message).includes(GLOBAL_SETTINGS)) process.stderr.write(pc.dim('Fix or delete the settings file and try again.\n'));
     process.exit(1);
   });

@@ -259,7 +259,6 @@ export class Transcript {
   private assistant: AssistantBlock | null = null;
   private thinking: ThinkingBlock | null = null;
   private tools = new Map<string, ToolBlock>();
-  private committedIdx = 0; // inline mode: blocks already written to scrollback
   lastToolOutput: { call: ToolCallBlock; output: ToolOutput; isError: boolean } | null = null;
   lastAssistantText = '';
   frame = 0;
@@ -402,7 +401,6 @@ export class Transcript {
         this.endText();
         // tool calls that never started (e.g. cut off by max_tokens) disappear
         this.blocks = this.blocks.filter((b) => !(b instanceof ToolBlock && b.status === 'pending'));
-        this.committedIdx = Math.min(this.committedIdx, this.blocks.length);
         this.tools.clear();
         break;
     }
@@ -414,35 +412,17 @@ export class Transcript {
     this.assistant = null;
     this.thinking = null;
     this.tools.clear();
-    this.committedIdx = 0;
     this.lastToolOutput = null;
     this.lastAssistantText = '';
     this.version++;
   }
 
-  /** Everything, rendered at width `w` (fullscreen view). */
+  /** Everything, rendered at width `w`. */
   render(w: number): string[] {
     const ctx = this.ctx();
     const out: string[] = [];
     for (const b of this.blocks) for (const l of b.lines(w, ctx)) out.push(l);
     return out;
-  }
-
-  /** Inline view: lines of newly finished blocks, in order, to write to scrollback. */
-  takeFinished(w: number): string[] {
-    const ctx = this.ctx();
-    const out: string[] = [];
-    while (this.committedIdx < this.blocks.length && this.blocks[this.committedIdx].done) {
-      out.push(...this.blocks[this.committedIdx].lines(w, ctx));
-      this.committedIdx++;
-    }
-    return out;
-  }
-
-  /** Inline view: blocks still in progress (and anything after them). */
-  live(w: number): string[] {
-    const ctx = this.ctx();
-    return this.blocks.slice(this.committedIdx).flatMap((b) => b.lines(w, ctx));
   }
 
   get busyLabel(): string {
@@ -458,18 +438,21 @@ export class Transcript {
     for (const m of messages) if (m.role === 'user') for (const b of m.content) if (b.type === 'tool_result') results.set(b.id, b);
     for (const m of messages) {
       if (m.role === 'user') {
-        const text = m.content
-          .filter((b) => b.type === 'text')
-          .map((b) => b.text)
-          .join('\n')
-          .trim();
+        // what the user typed is the first text block; @file attachments follow as their own blocks
+        const texts = m.content.filter((b) => b.type === 'text').map((b) => b.text).filter((t, i) => i === 0 || !t.startsWith('<wisp-note>'));
+        const attached = texts.slice(1).map((x) => /^<(file|directory) path="([^"]*)">/.exec(x)).filter((x) => x !== null);
+        const text = (attached.length === texts.length - 1 ? texts[0] ?? '' : texts.join('\n')).trim();
         const shell = /^I ran a shell command:\n\$ (.*)\n```\n([\s\S]*)\n```$/.exec(text);
         if (shell) {
           this.addDoneTool({ type: 'tool_call', id: `replay-${this.blocks.length}`, name: 'bash', input: { command: shell[1] } }, shell[1], shell[2], false);
         } else if (text.startsWith('The conversation so far was compacted')) {
           this.notice('⟳ (earlier conversation was compacted)');
           this.blank();
-        } else if (text) this.user(text.length > 4000 ? text.slice(0, 4000) + '…' : text);
+        } else if (text) {
+          this.user(text.length > 4000 ? text.slice(0, 4000) + '…' : text);
+          for (const a of attached) this.notice(`⎘ attached ${a![2]}${a![1] === 'directory' ? '/' : ''}`);
+          if (attached.length) this.blank();
+        }
         continue;
       }
       for (const b of m.content) {

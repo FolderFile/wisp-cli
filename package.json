@@ -1,9 +1,9 @@
 {
   "name": "wisp-cli",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A small, provider-agnostic coding agent for your terminal",
   "scripts": {
-    "build": "tsc",
+    "build": "rm -rf dist && tsc",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",

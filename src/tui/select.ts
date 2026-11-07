@@ -91,27 +91,4 @@ export class SelectList<T> {
     if (count) out.push(theme.dim(`${this.index + 1} of ${this.filtered.length}`));
     return out;
   }
-
-  render(width: number, maxRows = 10): string[] {
-    const out: string[] = [];
-    if (this.opts.title) {
-      const filter = this.opts.filterable ? theme.dim(this.filter ? `  filter: ${this.filter}` : '  type to filter') : '';
-      out.push(theme.bold(this.opts.title) + filter);
-    }
-    if (!this.filtered.length) out.push(theme.dim('  no matches'));
-    const start = Math.max(0, Math.min(this.index - Math.floor(maxRows / 2), this.filtered.length - maxRows));
-    const visible = this.filtered.slice(start, start + maxRows);
-    const labelW = Math.min(Math.max(...visible.map((o) => stringWidth(o.label)), 8), Math.floor(width * 0.55));
-    visible.forEach((o, i) => {
-      const active = start + i === this.index;
-      const marker = active ? theme.accent('› ') : '  ';
-      const label = padEnd(truncate(o.label, labelW), labelW);
-      const detail = o.detail ? theme.dim(truncate(o.detail, Math.max(4, width - labelW - 6))) : '';
-      const row = `${marker}${active ? theme.bold(label) : label}  ${detail}`;
-      out.push(truncate(row, width));
-    });
-    if (this.filtered.length > maxRows) out.push(theme.dim(`  ${this.index + 1}/${this.filtered.length}`));
-    out.push(theme.dim(truncate(this.opts.hint ?? '↑↓ navigate · enter select · esc cancel', width)));
-    return out;
-  }
 }

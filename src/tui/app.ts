@@ -1,8 +1,8 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
-import { Agent, type AgentEvent, type Approval } from '../core/agent.js';
+import { Agent, type AgentEvent } from '../core/agent.js';
 import { credentialSource, removeCredential, saveCredential, verifyCredential } from '../core/auth.js';
 import {
   availableModels,
@@ -29,11 +29,13 @@ import {
 import { describeError, isAbortError } from '../core/errors.js';
 import { exportSession } from '../core/export.js';
 import { buildUserContent, droppedImagePath } from '../core/input.js';
+import type { Feature, FeatureHost, FeatureUI, SlashCommand } from '../core/hooks.js';
 import { describeServer, isProjectTrusted, McpManager, trustProject, type McpServerEntry, type McpStatus } from '../core/mcp.js';
 import { BUILTIN_MODELS, DEFAULT_MODEL, type ModelInfo, type ProviderName } from '../core/models.js';
-import { buildTurnTree, countBranches, forkSession, listSessions, restore, Session, type RestoredState, type TurnNode } from '../core/session.js';
-import { AGENT_DIR, GLOBAL_SETTINGS, PERMISSION_MODES, type PermissionMode, type SettingsStore } from '../core/settings.js';
+import { buildTurnTree, countBranches, forkSession, listSessions, logAgentEvent, restore, Session, type RestoredState, type TurnNode } from '../core/session.js';
+import { AGENT_DIR, type PermissionMode, type Scope, type SettingsStore } from '../core/settings.js';
 import { THINKING_LEVELS, type ThinkingLevel } from '../core/types.js';
+import { builtinFeatures, featureCommands, featureStatus, featureWidgets, installFeatures, shutdownFeatures } from '../features/index.js';
 import { OpenAIProvider } from '../providers/openai.js';
 import { bashTool } from '../tools/bash.js';
 import type { Tool } from '../tools/types.js';
@@ -43,15 +45,15 @@ import { Dialog, TextInput } from './dialog.js';
 import { Editor } from './editor.js';
 import { FullScreen } from './fullscreen.js';
 import type { InputEvent, Key } from './keys.js';
-import { Screen } from './screen.js';
 import { SelectList, type Option } from './select.js';
 import { Terminal } from './terminal.js';
 import { formatDuration, formatTokens, padEnd, shortenHome, spread, stringWidth, truncate } from './text.js';
 import { SPINNER, theme, thinkingColor } from './theme.js';
-import { renderToolBody, Transcript } from './transcript.js';
+import { Transcript } from './transcript.js';
 
 const VERSION: string = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')).version;
 const HISTORY_FILE = join(AGENT_DIR, 'history.jsonl');
+const HISTORY_KEEP = 500;
 
 export interface AppOptions {
   cwd: string;
@@ -67,8 +69,10 @@ export interface AppOptions {
   restored?: RestoredState;
   initialPrompt?: string;
   persistSessions: boolean;
-  tuiMode: 'fullscreen' | 'inline';
-  mouse: boolean;
+  /** -r: open the conversation picker right away. */
+  openResume?: boolean;
+  /** Extra features (tests, embedders); the built-in ones are always installed. */
+  features?: Feature[];
   /** Configured MCP servers (already filtered by --no-mcp). */
   mcpServers: McpServerEntry[];
   /** --trust-project: start project MCP servers without asking. */
@@ -93,29 +97,6 @@ const KEY_HELP: Partial<Record<ProviderName, string>> = {
   anthropic: 'Create one at https://console.anthropic.com/settings/keys',
   openai: 'Create one at https://platform.openai.com/api-keys',
 };
-
-const COMMANDS: CommandInfo[] = [
-  { name: 'help', description: 'Shortcuts and commands (?)' },
-  { name: 'model', description: 'Switch model (ctrl+l)', args: '[name]' },
-  { name: 'login', description: 'Connect Anthropic, OpenAI or Ollama' },
-  { name: 'logout', description: 'Remove a saved API key' },
-  { name: 'tree', description: 'Browse branches of this conversation and jump back' },
-  { name: 'new', description: 'Start a new conversation' },
-  { name: 'resume', description: 'Open a saved conversation', args: '[all]' },
-  { name: 'fork', description: 'Copy this conversation (up to a message) into a new one' },
-  { name: 'compact', description: 'Summarize the conversation to free up context', args: '[focus]' },
-  { name: 'thinking', description: 'How hard the model thinks (shift+tab)', args: '[level]' },
-  { name: 'mode', description: 'When to ask before edits and commands', args: '[ask|auto-edit|yolo]' },
-  { name: 'name', description: 'Name this conversation', args: '<name>' },
-  { name: 'session', description: 'Conversation info: file, tokens, cost' },
-  { name: 'copy', description: 'Copy the last response (ctrl+x)' },
-  { name: 'export', description: 'Save the conversation as HTML or Markdown', args: '[file]' },
-  { name: 'mcp', description: 'MCP servers: status, tools, reconnect', args: '[tools|reconnect] [server]' },
-  { name: 'reload', description: 'Reload AGENTS.md, skills and prompt templates' },
-  { name: 'settings', description: 'Edit settings in your editor' },
-  { name: 'mouse', description: 'Release / capture the mouse (to select text)' },
-  { name: 'exit', description: 'Quit (ctrl+d)' },
-];
 
 const SHORTCUTS: [string, string][] = [
   ['enter', 'send (or steer)'],
@@ -143,8 +124,7 @@ function shortModelName(m: ModelInfo): string {
 
 export class App {
   private term = new Terminal();
-  private screen: Screen | null = null; // inline mode
-  private full: FullScreen | null = null; // fullscreen mode
+  private full: FullScreen;
   private editor = new Editor();
   private files: FileIndex;
   private autocomplete: Autocomplete;
@@ -170,20 +150,19 @@ export class App {
   private mcpStatus = new Map<string, McpStatus>();
   private firstRun: boolean;
   private exitResolve: (() => void) | null = null;
+  private commands: SlashCommand[] = [];
 
   constructor(private o: AppOptions) {
     const s = o.settings.merged;
-    this.showThinking = s.showThinking ?? true;
+    this.showThinking = s.showThinking;
     this.session = o.session;
     this.model = getModelInfo(o.model, s);
     this.files = new FileIndex(o.cwd);
     this.autocomplete = new Autocomplete(o.cwd, this.files, () => this.commandList());
     this.transcript = new Transcript({ showThinking: () => this.showThinking, verbose: () => this.verbose });
-    if (o.tuiMode === 'fullscreen') {
-      this.term.altScreen = true;
-      this.term.mouse = o.mouse;
-      this.full = new FullScreen(this.term);
-    } else this.screen = new Screen(this.term);
+    this.term.altScreen = true;
+    this.term.mouse = s.mouse;
+    this.full = new FullScreen(this.term);
     this.discover();
     const history = this.loadHistory();
     this.firstRun = history.length === 0;
@@ -199,14 +178,22 @@ export class App {
       model: this.model,
       tools: o.tools,
       system: this.systemPrompt(),
-      maxTokens: s.maxTokens,
       thinking: o.thinking,
-      permissionMode: o.permissionMode,
-      approver: (tool, input, preview, signal) => this.approve(tool, preview, signal),
       autoCompactAt: s.autoCompactAt,
     });
     if (o.restored) this.agent.load(o.restored.messages, o.restored);
     this.agent.subscribe((e) => this.onAgentEvent(e));
+    this.bindSettings();
+    const host: FeatureHost = {
+      cwd: o.cwd,
+      agent: this.agent,
+      settings: o.settings,
+      ui: this.featureUI(),
+      session: () => this.session,
+      refreshTools: () => this.agent.refreshTools(),
+    };
+    installFeatures(host, [...builtinFeatures({ permissionMode: o.permissionMode }), ...(o.features ?? [])]);
+    this.commands = [...this.coreCommands(), ...featureCommands(this.agent.features)];
     this.editor.setHistory(history);
     this.editor.onChange = () => this.autocomplete.update(this.editor);
   }
@@ -237,19 +224,74 @@ export class App {
 
   private commandList(): CommandInfo[] {
     return [
-      ...COMMANDS,
-      ...this.templates.map((t) => ({ name: t.name, description: t.description, args: '[args]' })),
+      ...this.commands.map((c) => ({ name: c.name, description: c.description })),
+      ...this.templates.map((t) => ({ name: t.name, description: t.description })),
       ...this.skills.map((s) => ({ name: `skill:${s.name}`, description: s.description })),
     ];
   }
 
+  /** Live-apply hooks for core settings (persisting happens in SettingsStore.set). */
+  private bindSettings() {
+    const st = this.o.settings;
+    st.onApply('showThinking', (v: boolean) => (this.showThinking = v));
+    st.onApply('mouse', (v: boolean) => this.term.setMouse(v));
+    st.onApply('autoCompactAt', (v: number) => (this.agent.opts.autoCompactAt = v));
+    st.onApply('thinking', (v: ThinkingLevel) => (this.agent.opts.thinking = v));
+  }
+
+  /** The UI surface handed to features. */
+  private featureUI(): FeatureUI {
+    const app = this;
+    return {
+      interactive: true,
+      notice: (text, kind) => {
+        this.transcript.notice(text, kind);
+        this.render();
+      },
+      flash: (text, ms) => this.flashMessage(text, ms),
+      render: () => this.render(),
+      get height() {
+        return app.height;
+      },
+      select: (o) =>
+        new Promise((resolve) => {
+          const list = new SelectList(o.options, { filterable: o.filterable, initial: o.initial });
+          let done = false;
+          const finish = (v: any) => {
+            if (done) return;
+            done = true;
+            o.signal?.removeEventListener('abort', onAbort);
+            resolve(v);
+          };
+          const d = new Dialog<any>({ title: o.title, body: o.body, list, anchor: o.anchor, width: o.anchor === 'bottom' ? 200 : 76, hint: o.hint, onSelect: finish, onCancel: () => finish(undefined) });
+          const onAbort = () => {
+            if (this.dialog === d) this.closeDialog();
+            finish(undefined);
+          };
+          if (o.signal?.aborted) return finish(undefined);
+          o.signal?.addEventListener('abort', onAbort, { once: true });
+          this.openDialog(d);
+        }),
+      input: (o) =>
+        new Promise((resolve) => {
+          const input = new TextInput({ initial: o.initial, placeholder: o.placeholder });
+          this.openDialog(new Dialog({ title: o.title, width: 76, body: o.body ? () => o.body! : undefined, input, onSubmit: (v) => void resolve(v), onCancel: () => resolve(undefined) }));
+        }),
+    };
+  }
+
   private loadHistory(): string[] {
     try {
-      return readFileSync(HISTORY_FILE, 'utf8')
-        .split('\n')
-        .filter(Boolean)
-        .slice(-500)
-        .map((l) => JSON.parse(l));
+      const lines = readFileSync(HISTORY_FILE, 'utf8').split('\n').filter(Boolean);
+      // keep the file bounded: rewrite it once it has grown well past what we read
+      if (lines.length > HISTORY_KEEP * 2) writeFileSync(HISTORY_FILE, lines.slice(-HISTORY_KEEP).join('\n') + '\n');
+      return lines.slice(-HISTORY_KEEP).flatMap((l) => {
+        try {
+          return [JSON.parse(l)];
+        } catch {
+          return [];
+        }
+      });
     } catch {
       return [];
     }
@@ -282,21 +324,34 @@ export class App {
       this.agent.setModel(new UnconfiguredProvider(), this.model);
     this.header();
     if (this.o.restored?.messages.length) this.replayConversation(`Resumed ${this.session.name ? `“${this.session.name}”` : 'your last conversation'}`);
+    this.showSettingsWarnings();
+    this.emitSessionLoaded(this.o.restored ? 'resume' : 'startup');
     this.term.start((e) => this.onInput(e), () => {
-      this.screen?.resized();
-      this.full?.resized();
+      this.full.resized();
       this.render();
     });
     this.render();
     if (!this.configured) this.openLogin('Welcome! Pick how wisp should talk to a model. You can change this any time with /login.');
+    else if (this.o.openResume) this.openResume(false);
     await this.startMcp();
     if (this.o.initialPrompt) void this.submitText(this.o.initialPrompt);
     await new Promise<void>((r) => (this.exitResolve = r));
   }
 
+  private showSettingsWarnings() {
+    for (const w of this.o.settings.takeWarnings()) this.transcript.notice(`⚠ ${w}`, 'warn');
+  }
+
+  private emitSessionLoaded(reason: 'startup' | 'new' | 'resume' | 'fork') {
+    for (const f of this.agent.features)
+      try {
+        f.sessionLoaded?.({ session: this.session, reason });
+      } catch {}
+  }
+
   /** Called by main() after run() returns: stop MCP server processes. */
   async shutdown() {
-    await this.mcp?.close();
+    await Promise.all([this.mcp?.close(), shutdownFeatures(this.agent.features)]);
   }
 
   private header() {
@@ -314,7 +369,7 @@ export class App {
     if (loaded.length && !s.quietStartup) t.commit(theme.dim(`loaded ${loaded.join(' · ')}`));
     if (this.firstRun && !s.quietStartup) {
       t.blank();
-      t.commit(`Ask wisp to explain, fix or build things in this folder. It reads files, edits them and runs commands, and asks before changing anything.`);
+      t.commit(`Ask wisp to explain, fix or build things in this folder. It reads files, edits them and runs commands.`);
       t.commit(theme.dim(`try  ${theme.accent('“give me a tour of this codebase”')}  ·  ${theme.accent('@')} attach a file  ·  ${theme.accent('/')} commands  ·  ${theme.accent('?')} shortcuts`));
     }
     t.blank();
@@ -334,8 +389,7 @@ export class App {
   private exit() {
     if (this.turn) this.turn.abort();
     this.stopTicker();
-    this.screen?.close();
-    this.full?.close();
+    this.full.close();
     this.term.stop();
     const u = this.agent.usage;
     const parts = [];
@@ -408,66 +462,54 @@ export class App {
     this.render();
   }
 
-  private mcpCommand(args: string) {
+  private mcpCommand() {
     const t = this.transcript;
-    const [sub, name] = args.split(/\s+/).filter(Boolean);
     const mcp = this.mcp;
     if (!mcp?.servers.length) {
       if (this.o.mcpServers.length) return t.notice('MCP servers are configured but were not started (skipped project servers, or --no-mcp).');
-      return t.notice('No MCP servers yet. Add one from your shell:  wisp mcp add <name> -- <command> [args…]   or   wisp mcp add <name> --url <url>');
-    }
-    const pick = (n?: string) => {
-      const s = n ? mcp.get(n) : undefined;
-      if (n && !s) t.notice(`No MCP server named "${n}". Configured: ${mcp.servers.map((x) => x.name).join(', ')}`, 'error');
-      return s;
-    };
-    if (sub === 'reconnect') {
-      const targets = name ? [pick(name)].filter(Boolean) : mcp.servers.filter((s) => s.status !== 'disabled');
-      for (const s of targets) {
-        this.mcpStatus.delete(s!.name);
-        t.notice(`Reconnecting ${s!.name}…`);
-        void s!.connect();
-      }
-      return;
-    }
-    if (sub === 'tools') {
-      const servers = name ? [pick(name)].filter(Boolean) : mcp.servers;
-      t.blank();
-      for (const s of servers) {
-        t.commit(theme.bold(`${s!.name}`) + theme.dim(` · ${s!.tools.length} tools`));
-        for (const tool of s!.tools) t.commit(`  ${theme.accent(tool.name)}  ${theme.dim(truncate((tool.description ?? '').split('\n')[0], 100))}`);
-      }
-      t.blank();
-      return;
+      return t.notice('No MCP servers yet. Add one from your shell:  wisp mcp add NAME -- COMMAND   or   wisp mcp add NAME --url URL');
     }
     const icon: Record<McpStatus, string> = { connected: theme.success('●'), failed: theme.error('●'), connecting: theme.warn('◌'), disabled: theme.dim('○') };
-    t.blank();
-    t.commit(theme.bold('MCP servers'));
-    for (const s of mcp.servers) {
+    const options = mcp.servers.map((s) => {
       const info = s.status === 'connected' ? `${s.tools.length} tools${s.serverInfo ? ` · ${s.serverInfo.name} ${s.serverInfo.version}` : ''}` : s.status === 'failed' ? (s.error ?? 'failed') : s.status;
-      t.commit(`  ${icon[s.status]} ${theme.bold(s.name)} ${theme.dim(`(${s.entry.scope})`)}  ${s.status === 'failed' ? theme.error(info) : theme.dim(info)}`);
-      t.commit(theme.dim(`      ${describeServer(s.entry.config)}`));
-      if (s.status === 'failed' && s.stderr.length) for (const l of s.stderr.slice(-5)) t.commit(theme.dim(`      │ ${l}`));
-    }
-    t.commit(theme.dim('  /mcp tools [server] · /mcp reconnect [server] · config: ~/.wisp/mcp.json, .mcp.json'));
-    t.blank();
+      return { label: `${icon[s.status]} ${s.name} ${theme.dim(`(${s.entry.scope})`)}`, detail: info, value: s };
+    });
+    type Server = (typeof options)[number]['value'];
+    const showTools = (s: Server) => {
+      t.blank();
+      t.commit(theme.bold(s.name) + theme.dim(` · ${s.tools.length} tools · ${describeServer(s.entry.config)}`));
+      if (s.status === 'failed') for (const l of s.stderr.slice(-5)) t.commit(theme.dim(`  │ ${l}`));
+      for (const tool of s.tools) t.commit(`  ${theme.accent(tool.name)}  ${theme.dim(truncate((tool.description ?? '').split('\n')[0], 100))}`);
+      t.blank();
+    };
+    const reconnect = (s: Server | undefined) => {
+      for (const x of s ? [s] : mcp.servers.filter((x) => x.status !== 'disabled')) {
+        this.mcpStatus.delete(x.name);
+        t.notice(`Reconnecting ${x.name}…`);
+        void x.connect();
+      }
+    };
+    this.openDialog(
+      new Dialog<Server>({
+        title: 'MCP servers',
+        width: 90,
+        body: () => [theme.dim('config: ~/.wisp/mcp.json, .mcp.json · add servers with: wisp mcp add')],
+        list: new SelectList(options),
+        onSelect: showTools,
+        keys: [
+          { key: 'r', label: 'reconnect', run: (s) => reconnect(s) },
+          { key: 'a', label: 'reconnect all', run: () => reconnect(undefined) },
+        ],
+        hint: 'enter show tools · r reconnect · a reconnect all · esc close',
+      }),
+    );
   }
 
   // --- agent events -----------------------------------------------------------
 
   private onAgentEvent(e: AgentEvent) {
     this.transcript.handle(e);
-    switch (e.type) {
-      case 'message':
-        this.session.log({ type: 'message', message: e.message });
-        if (e.message.role === 'assistant')
-          this.session.log({ type: 'usage', usage: this.agent.usage, costUSD: this.agent.costUSD, contextUsed: this.agent.contextUsed });
-        break;
-      case 'compaction_end':
-        this.session.log({ type: 'compaction', summary: e.summary, tokensBefore: e.tokensBefore });
-        this.session.log({ type: 'usage', usage: this.agent.usage, costUSD: this.agent.costUSD, contextUsed: 0 });
-        break;
-    }
+    logAgentEvent(this.session, this.agent, e);
     this.render();
   }
 
@@ -493,11 +535,11 @@ export class App {
   }
 
   private get width() {
-    return (this.full ?? this.screen!).width;
+    return this.full.width;
   }
 
   private get height() {
-    return (this.full ?? this.screen!).height;
+    return this.full.height;
   }
 
   /** Content width: one column of margin on each side. */
@@ -518,10 +560,11 @@ export class App {
     }
     for (const q of this.agent.queued) bottom.push(theme.dim(truncate(`↳ next step: ${q}`, w)));
     for (const q of this.followUps) bottom.push(theme.dim(truncate(`⧗ queued: ${q}`, w)));
+    for (const l of featureWidgets(this.agent.features)) bottom.push(truncate(l, w));
 
     let cursor: { row: number; col: number } | null = null;
     const d = this.dialog;
-    const inlineDialog = d && (d.anchor === 'bottom' || !this.full);
+    const inlineDialog = d && d.anchor === 'bottom';
     if (inlineDialog) {
       const r = d.render(w, Math.max(6, this.height - bottom.length - 2));
       if (r.cursor) cursor = { row: bottom.length + r.cursor.row, col: r.cursor.col };
@@ -542,18 +585,12 @@ export class App {
 
     const lines = bottom.map(pad);
     const cur = cursor && { row: cursor.row, col: cursor.col + 1 };
-    if (this.full) {
-      let overlay = null;
-      if (d && !inlineDialog) {
-        const r = d.render(Math.min(this.width - 4, 90), this.full.viewportHeight(lines.length) - 2);
-        overlay = { lines: r.lines, cursor: r.cursor };
-      }
-      return this.full.draw(() => this.transcript.render(w).map(pad), lines, overlay ? null : cur, overlay);
+    let overlay = null;
+    if (d && !inlineDialog) {
+      const r = d.render(Math.min(this.width - 4, 90), this.full.viewportHeight(lines.length) - 2);
+      overlay = { lines: r.lines, cursor: r.cursor };
     }
-    const screen = this.screen!;
-    screen.commit(this.transcript.takeFinished(w).map(pad));
-    const live = this.transcript.live(w).map(pad);
-    screen.setLive([...live, ...lines], cur && { row: cur.row + live.length, col: cur.col });
+    this.full.draw(() => this.transcript.render(w).map(pad), lines, overlay ? null : cur, overlay);
   }
 
   private footer(w: number): string[] {
@@ -566,7 +603,7 @@ export class App {
       const text = m.connecting ? `mcp ${m.connected}/${m.total}…` : m.failed ? `mcp ${m.connected}/${m.total}` : `mcp ${m.connected}`;
       right.push(m.failed ? theme.warn(text) : theme.dim(text));
     }
-    if (a.opts.permissionMode !== 'ask') right.push(a.opts.permissionMode === 'yolo' ? theme.warn('yolo') : theme.dim('auto-edit'));
+    for (const st of featureStatus(a.features)) right.push(theme.dim(st));
     const pct = this.model.contextWindow ? (a.contextUsed / this.model.contextWindow) * 100 : 0;
     const ctxColor = pct >= 80 ? theme.error : pct >= 60 ? theme.warn : theme.dim;
     right.push(ctxColor(pct >= 1 ? `ctx ${Math.round(pct)}%` : `ctx ${formatTokens(a.contextUsed)}`));
@@ -576,7 +613,7 @@ export class App {
     if (this.flash && this.flash.until > Date.now()) return [line1, truncate(theme.accent(this.flash.text), w)];
     // [text, priority]: when the line is too narrow, the lowest priorities go first
     let hints: [string, number][];
-    if (this.full && !this.full.following) hints = [['end back to latest', 3], ['pgup/pgdn scroll', 2], ['esc', 1]];
+    if (!this.full.following) hints = [['end back to latest', 3], ['pgup/pgdn scroll', 2], ['esc', 1]];
     else if (this.busy) hints = [['esc stop', 5], ['enter add a note', 3], ['alt+enter queue', 2], ['ctrl+o output', 1]];
     else if (!this.configured) hints = [['/login set up a model', 5], ['? help', 4]];
     else if (!this.editor.isEmpty) hints = [['enter send', 5], ['shift+enter new line', 3], ['@ attach', 2], ['ctrl+g editor', 1]];
@@ -593,7 +630,7 @@ export class App {
 
   private onInput(e: InputEvent) {
     if (e.type === 'mouse') {
-      if (e.wheel && this.full && !this.dialog) this.full.scrollBy(e.wheel === 'up' ? -3 : 3);
+      if (e.wheel && !this.dialog) this.full.scrollBy(e.wheel === 'up' ? -3 : 3);
       return this.render();
     }
     if (e.type === 'paste') {
@@ -628,37 +665,34 @@ export class App {
       }
       if (id === 'enter') {
         const inserted = this.autocomplete.accept(this.editor);
-        // run it right away unless it needs an argument (<required>)
-        const cmd = inserted?.startsWith('/') && this.commandList().find((c) => `/${c.name} ` === inserted);
-        if (cmd && !cmd.args?.startsWith('<')) this.submit();
+        // commands never need arguments: run it right away
+        if (inserted?.startsWith('/') && this.commandList().some((c) => `/${c.name} ` === inserted)) this.submit();
         return;
       }
     }
 
-    if (this.full) {
-      switch (id) {
-        case 'pageup':
-          return this.full.page(-1);
-        case 'pagedown':
-          return this.full.page(1);
-        case 'S-up':
-          return this.full.scrollBy(-1);
-        case 'S-down':
-          return this.full.scrollBy(1);
-        case 'C-home':
-          if (this.editor.isEmpty) return this.full.toTop();
-          break;
-        case 'end':
-        case 'C-end':
-          if (!this.full.following && this.editor.isEmpty) return this.full.toBottom();
-          break;
-      }
+    switch (id) {
+      case 'pageup':
+        return this.full.page(-1);
+      case 'pagedown':
+        return this.full.page(1);
+      case 'S-up':
+        return this.full.scrollBy(-1);
+      case 'S-down':
+        return this.full.scrollBy(1);
+      case 'C-home':
+        if (this.editor.isEmpty) return this.full.toTop();
+        break;
+      case 'end':
+      case 'C-end':
+        if (!this.full.following && this.editor.isEmpty) return this.full.toBottom();
+        break;
     }
 
     switch (id) {
       case 'escape':
         if (this.busy) this.interrupt();
-        else this.full?.toBottom();
+        else this.full.toBottom();
         return;
       case 'enter':
         if (this.editor.beforeCursor.endsWith('\\')) {
@@ -682,10 +716,10 @@ export class App {
         return this.openModelPicker();
       case 'C-p':
         return this.cycleFavorite();
-      case 'C-t':
-        this.showThinking = !this.showThinking;
-        this.o.settings.saveGlobal({ showThinking: this.showThinking });
-        return this.flashMessage(this.showThinking ? 'thinking shown' : 'thinking hidden');
+      case 'C-t': {
+        const r = this.o.settings.set('showThinking', !this.showThinking);
+        return this.flashMessage((this.showThinking ? 'thinking shown' : 'thinking hidden') + this.persistNote('showThinking', r));
+      }
       case 'C-o':
         return this.expandToolOutput();
       case 'C-g':
@@ -738,11 +772,14 @@ export class App {
     this.saveHistory(raw);
     this.editor.clear();
     this.autocomplete.close();
-    this.full?.toBottom();
+    this.full.toBottom();
     if (this.busy) {
       if (isCommand) {
+        const name = /^\/(\S+)/.exec(text.trim())?.[1];
+        const cmd = this.commands.find((c) => c.name === name);
+        if (cmd?.whileBusy) return void this.command(text.trim());
         this.editor.setText(raw);
-        return this.flashMessage('commands run once wisp is idle · esc to stop it', 2500);
+        return this.flashMessage(`${name ? '/' + name : 'that'} runs once wisp is idle · esc to stop it`, 2500);
       }
       if (kind === 'follow-up') this.followUps.push(text);
       else this.agent.steer(text);
@@ -854,43 +891,6 @@ export class App {
     this.render();
   }
 
-  private approve(tool: Tool, preview: string, signal: AbortSignal): Promise<Approval> {
-    return new Promise((resolveApproval) => {
-      const name = tool.mcp ? `${tool.mcp.server} › ${tool.mcp.tool}` : tool.name;
-      const what = tool.mcp ? 'calls' : tool.permission === 'exec' ? 'commands' : 'edits';
-      const title = tool.mcp ? `Allow ${name}?` : tool.permission === 'exec' ? 'Run this command?' : tool.name === 'write_file' ? 'Write this file?' : 'Make this edit?';
-      const list = new SelectList<Approval>([
-        { label: 'Yes', value: 'yes', hotkey: 'y', detail: 'y' },
-        { label: `Yes, and don’t ask again for ${tool.mcp ? name : tool.name} ${what} this session`, value: 'always', hotkey: 'a', detail: 'a' },
-        { label: 'No, and tell wisp what to do instead', value: 'no', hotkey: 'n', detail: 'n' },
-      ]);
-      const done = (a: Approval) => {
-        signal.removeEventListener('abort', onAbort);
-        resolveApproval(a);
-      };
-      const d = new Dialog<Approval>({
-        title,
-        anchor: 'bottom',
-        width: 200,
-        body: () => {
-          const maxPreview = Math.max(4, this.height - 14);
-          const body = preview.split('\n');
-          return body.length > maxPreview ? [...body.slice(0, maxPreview), theme.dim(`… ${body.length - maxPreview} more lines`)] : body;
-        },
-        list,
-        onSelect: done,
-        onCancel: () => done('no'),
-        hint: 'y yes · a always · n no · esc no',
-      });
-      const onAbort = () => {
-        if (this.dialog === d) this.closeDialog();
-        done('no');
-      };
-      signal.addEventListener('abort', onAbort, { once: true });
-      this.openDialog(d);
-    });
-  }
-
   private openHelp() {
     const cmds = this.commandList();
     const list = new SelectList(
@@ -918,7 +918,7 @@ export class App {
         list,
         onSelect: (c) => {
           this.editor.setText(`/${c.name} `);
-          if (!c.args?.startsWith('<')) setImmediate(() => this.submit());
+          setImmediate(() => this.submit());
         },
         hint: 'type to search · enter use · esc close',
       }),
@@ -958,20 +958,41 @@ export class App {
     );
   }
 
-  private switchModel(ref: ModelRef, quiet = false) {
+  /**
+   * Use another model. `persist` (default): it becomes the default for new runs.
+   * Loading a conversation passes persist: false so the global default stays.
+   */
+  private switchModel(ref: ModelRef, o: { quiet?: boolean; persist?: boolean; log?: boolean } = {}) {
     const s = this.o.settings.merged;
     try {
       const provider = createProvider(ref, s);
       this.model = getModelInfo(ref, s);
       this.agent.setModel(provider, this.model);
       this.o.model = ref;
-      this.o.settings.saveGlobal({ provider: ref.provider, model: ref.id });
-      this.session.log({ type: 'model', provider: ref.provider, model: ref.id, thinking: this.agent.thinking });
-      if (!quiet) this.transcript.notice(`Now using ${shortModelName(this.model)}${this.model.provider === 'ollama' ? ' (local)' : ''} · thinking ${this.agent.thinking}`);
+      let note = '';
+      if (o.persist !== false) {
+        this.o.settings.set('provider', ref.provider);
+        const r = this.o.settings.set('model', ref.id);
+        note = this.persistNote('model', r);
+      }
+      if (o.log !== false) this.logModel();
+      if (!o.quiet) this.transcript.notice(`Now using ${shortModelName(this.model)}${this.model.provider === 'ollama' ? ' (local)' : ''} · thinking ${this.agent.thinking}${note}`);
     } catch (err) {
       this.transcript.notice(describeError(err), 'error');
     }
     this.render();
+  }
+
+  /** Record the model and thinking level in the conversation, so resuming restores both. */
+  private logModel() {
+    this.session.log({ type: 'model', provider: this.o.model.provider, model: this.o.model.id, thinking: this.agent.opts.thinking });
+  }
+
+  /** "" or a note that the project file still overrides a global change. */
+  private persistNote(key: string, r: { overridden: boolean; error?: string }): string {
+    if (r.error) return ` (not saved: ${r.error})`;
+    if (r.overridden) return ` (saved, but this project's .wisp/settings.json overrides ${key}; /settings to change it there)`;
+    return '';
   }
 
   private cycleFavorite() {
@@ -982,11 +1003,14 @@ export class App {
     this.switchModel(refs[(i + 1) % refs.length]);
   }
 
+  /** Thinking chosen by the user: becomes the default and is recorded in the conversation. */
   private setThinking(level: ThinkingLevel) {
-    this.agent.opts.thinking = level;
-    this.o.settings.saveGlobal({ thinking: level });
+    const r = this.o.settings.set('thinking', level);
+    this.agent.opts.thinking = level; // also when a project value keeps the default elsewhere
+    this.logModel();
     const actual = this.agent.thinking;
-    this.flashMessage(actual === level ? `thinking: ${level}` : `thinking: ${actual} (${shortModelName(this.model)} can't do ${level})`, 2000);
+    const note = this.persistNote('thinking', r);
+    this.flashMessage((actual === level ? `thinking: ${level}` : `thinking: ${actual} (${shortModelName(this.model)} can't do ${level})`) + note, note ? 4000 : 2000);
   }
 
   private cycleThinking() {
@@ -995,36 +1019,18 @@ export class App {
     this.setThinking(levels[(i + 1) % levels.length]);
   }
 
-  private setMode(mode: PermissionMode) {
-    this.agent.opts.permissionMode = mode;
-    this.o.settings.saveGlobal({ permissionMode: mode });
-    this.transcript.notice(
-      `Mode: ${mode} — ${mode === 'ask' ? 'asks before edits and commands' : mode === 'auto-edit' ? 'edits files freely, asks before commands' : 'never asks (only use in a sandbox)'}`,
-      mode === 'yolo' ? 'warn' : 'info',
-    );
-  }
-
   private expandToolOutput() {
     this.verbose = !this.verbose;
-    const last = this.transcript.lastToolOutput;
-    // fullscreen re-renders every tool block with the new setting; inline can only append
-    if (this.verbose && last && !this.full) {
-      this.transcript.blank();
-      this.transcript.notice(`Full output of the last ${last.call.name} call:`);
-      this.transcript.commit(renderToolBody(last.call, last.output, last.isError, this.contentWidth, true));
-      this.transcript.blank();
-    }
     this.flashMessage(this.verbose ? 'tool output: full' : 'tool output: short');
   }
 
   // --- login ------------------------------------------------------------------
 
   private openLogin(message?: string) {
-    const s = this.o.settings.merged;
     const status = (p: ProviderName) => {
       if (p === 'ollama') return this.ollamaModels.length ? `running · ${this.ollamaModels.length} model${this.ollamaModels.length > 1 ? 's' : ''}` : 'free, runs on your machine';
-      const src = credentialSource(p, s.providers?.[p]?.apiKey);
-      return src === 'login' ? '✓ key saved' : src === 'env' ? '✓ key from environment' : src === 'settings' ? '✓ key in settings' : 'needs an API key';
+      const src = credentialSource(p);
+      return src === 'login' ? '✓ key saved' : src === 'env' ? '✓ key from environment' : 'needs an API key';
     };
     const list = new SelectList<ProviderName>(
       (['anthropic', 'openai', 'ollama'] as ProviderName[]).map((p) => ({ label: PROVIDER_LABEL[p], detail: status(p), value: p })),
@@ -1086,7 +1092,7 @@ export class App {
             d.status = null;
             if (this.dialog === d) this.closeDialog();
             const ref = this.model.provider === p && this.configured ? this.o.model : { provider: p, id: DEFAULT_MODEL[p] };
-            this.switchModel(ref, true);
+            this.switchModel(ref, { quiet: true });
             this.transcript.notice(`✓ Connected to ${PROVIDER_LABEL[p]} · using ${shortModelName(this.model)} · ctrl+l to switch models`, 'success');
             this.transcript.blank();
           })
@@ -1114,8 +1120,13 @@ export class App {
         list,
         onSelect: (p) => {
           removeCredential(p);
-          this.transcript.notice(`Removed the saved ${PROVIDER_LABEL[p]} key.`);
-          if (this.model.provider === p && credentialSource(p) === null) this.agent.setModel(new UnconfiguredProvider(), this.model);
+          const env = credentialSource(p) === 'env';
+          this.transcript.notice(`Removed the saved ${PROVIDER_LABEL[p]} key.${env ? ' The key from the environment is used now.' : ''}`);
+          // rebuild the provider so the removed key isn't kept in memory
+          if (this.model.provider === p) {
+            if (env) this.switchModel(this.o.model, { quiet: true, persist: false, log: false });
+            else this.agent.setModel(new UnconfiguredProvider(), this.model);
+          }
         },
       }),
     );
@@ -1127,9 +1138,8 @@ export class App {
       this.transcript.notice(`No editor found. Set $EDITOR (e.g. export EDITOR=nano) or edit ${shortenHome(file)} directly.`, 'error');
       return false;
     }
-    this.screen?.close();
     const r = await this.term.suspendFor(() => spawnSync('sh', ['-c', `${editorCmd} "$1"`, 'sh', file], { stdio: 'inherit' }));
-    this.full?.resized();
+    this.full.resized();
     if (r.status !== 0) {
       this.transcript.notice(`The editor (${editorCmd}) exited with an error${r.status === 127 ? ': command not found' : ''}.`, 'error');
       return false;
@@ -1165,14 +1175,16 @@ export class App {
     this.transcript.notice(theme.accent(notice));
     this.transcript.blank();
     this.transcript.replay(this.agent.messages);
-    this.full?.toBottom();
+    this.full.toBottom();
   }
 
   private newSession() {
     this.session = Session.create(this.o.cwd, { persist: this.o.persistSessions });
     this.agent.load([]);
+    this.logModel();
     this.transcript.reset();
     this.header();
+    this.emitSessionLoaded('new');
     this.render();
   }
 
@@ -1185,16 +1197,20 @@ export class App {
     const state = restore(entries);
     this.session = session;
     this.agent.load(state.messages, state);
+    // the conversation's own model and thinking, without changing the global defaults
     if (state.model) {
       const ref = { provider: state.model.provider as ModelRef['provider'], id: state.model.model };
-      if (ref.id !== this.model.id) this.switchModel(ref, true);
+      this.agent.opts.thinking = state.model.thinking;
+      if (ref.id !== this.o.model.id || ref.provider !== this.o.model.provider) this.switchModel(ref, { quiet: true, persist: false, log: false });
     }
     this.replayConversation(`Opened ${session.name ? `“${session.name}”` : 'conversation'}`);
+    this.emitSessionLoaded('resume');
   }
 
   private openResume(all: boolean) {
+    if (this.busy) return void this.flashMessage('stop the current task first (esc)');
     const sessions = listSessions(all ? null : this.o.cwd).filter((s) => s.path !== this.session.path);
-    if (!sessions.length) return this.transcript.notice(all ? 'No saved conversations yet.' : 'No other conversations in this folder yet. Try /resume all.');
+    const toggle = { key: 'tab', label: all ? 'this folder' : 'all folders', run: () => void setImmediate(() => this.openResume(!all)) };
     const list = new SelectList(
       sessions.map((s) => ({
         label: truncate(s.name ?? s.firstMessage, 56),
@@ -1206,10 +1222,13 @@ export class App {
     );
     this.openDialog(
       new Dialog<string>({
-        title: all ? 'Open a conversation (all folders)' : 'Open a conversation',
+        title: all ? 'Open a conversation (all folders)' : 'Open a conversation (this folder)',
         width: 90,
+        body: sessions.length ? undefined : () => [theme.dim(all ? 'No saved conversations yet.' : 'No other conversations in this folder yet. Press tab to see all folders.')],
         list,
+        keys: [toggle],
         onSelect: (path) => this.loadSession(path),
+        hint: `type to search · enter open · tab ${toggle.label} · esc close`,
       }),
     );
   }
@@ -1258,7 +1277,7 @@ export class App {
         width: 100,
         body: () => [
           theme.dim('Go back to any message and carry on from there. Other branches are kept.'),
-          theme.dim('Only the conversation moves: files on disk stay as they are.'),
+          theme.dim('Files stay as they are, unless checkpoints offer to restore them to that point.'),
         ],
         list,
         onSelect: (n) => this.jumpTo(n, 'continue'),
@@ -1271,11 +1290,16 @@ export class App {
   private jumpTo(n: TurnNode, how: 'continue' | 'edit') {
     if (this.busy) return void this.flashMessage('stop the current task first (esc)');
     if (how === 'edit' && n.kind !== 'prompt') return void this.flashMessage('only your own messages can be edited');
+    const from = this.session.head;
     this.session.moveHead(how === 'continue' ? n.endId : n.parentId);
     const state = restore(this.session.entries);
     this.agent.load(state.messages, state);
     this.replayConversation(how === 'continue' ? '↶ Back at an earlier point. Your next message starts a new branch (/tree to switch).' : '✎ Editing an earlier message. Send it to start a new branch (/tree to switch back).');
     if (how === 'edit') this.editor.setText(n.text);
+    for (const f of this.agent.features)
+      try {
+        f.branchChanged?.({ session: this.session, from });
+      } catch {}
     this.render();
   }
 
@@ -1311,6 +1335,7 @@ export class App {
           this.agent.load(state.messages, state);
           this.replayConversation(`⑂ New conversation ${fork.id}, copied from the previous one.`);
           if (n) this.editor.setText(n.text);
+          this.emitSessionLoaded('fork');
         },
       }),
     );
@@ -1322,110 +1347,14 @@ export class App {
     const [, name, rest = ''] = /^\/(\S+)\s*([\s\S]*)$/.exec(input) ?? [];
     const args = rest.trim();
     const t = this.transcript;
-    switch (name) {
-      case 'help':
-      case 'hotkeys':
-      case '?':
-        return this.openHelp();
-      case 'login':
-        return this.openLogin();
-      case 'logout':
-        return this.openLogout();
-      case 'model':
-        return this.openModelPicker(args);
-      case 'tree':
-        return this.openTree();
-      case 'thinking': {
-        if (args && THINKING_LEVELS.includes(args as ThinkingLevel)) return this.setThinking(args as ThinkingLevel);
-        const levels = this.model.thinking;
-        const describe: Record<ThinkingLevel, string> = {
-          off: 'answer straight away',
-          low: 'quick, light reasoning',
-          medium: 'balanced (default)',
-          high: 'more careful',
-          xhigh: 'very careful, slower',
-          max: 'deepest, slowest, priciest',
-        };
-        const list = new SelectList(levels.map((l) => ({ label: l, value: l, detail: describe[l] })), { initial: levels.indexOf(this.agent.thinking) });
-        return this.openDialog(new Dialog<ThinkingLevel>({ title: `How hard should ${shortModelName(this.model)} think?`, width: 60, list, onSelect: (l) => this.setThinking(l) }));
+    const cmd = this.commands.find((c) => c.name === name);
+    if (cmd) {
+      try {
+        await cmd.run(args);
+      } catch (err) {
+        t.notice(`/${name} failed: ${describeError(err)}`, 'error');
       }
-      case 'mode': {
-        if (PERMISSION_MODES.includes(args as PermissionMode)) return this.setMode(args as PermissionMode);
-        const list = new SelectList(
-          [
-            { label: 'ask', value: 'ask' as PermissionMode, detail: 'ask before every edit and command' },
-            { label: 'auto-edit', value: 'auto-edit' as PermissionMode, detail: 'edit files freely, ask before commands' },
-            { label: 'yolo', value: 'yolo' as PermissionMode, detail: 'never ask — only in a sandbox' },
-          ],
-          { initial: PERMISSION_MODES.indexOf(this.agent.opts.permissionMode) },
-        );
-        return this.openDialog(new Dialog<PermissionMode>({ title: 'When should wisp ask first?', width: 64, list, onSelect: (m) => this.setMode(m) }));
-      }
-      case 'new':
-      case 'clear':
-        return this.newSession();
-      case 'resume':
-        return this.openResume(args === 'all');
-      case 'fork':
-        return this.openFork();
-      case 'name':
-        if (!args) return t.notice('Usage: /name <a name for this conversation>', 'warn');
-        this.session.log({ type: 'name', name: args });
-        return this.flashMessage(`named “${args}”`);
-      case 'session': {
-        const u = this.agent.usage;
-        const branches = countBranches(buildTurnTree(this.session.entries));
-        t.blank();
-        t.commit(theme.bold('This conversation'));
-        t.commit(`  id        ${this.session.id}${this.session.name ? ` (${this.session.name})` : ''}`);
-        t.commit(`  file      ${this.session.path ? shortenHome(this.session.path) : '(not saved: --no-session)'}`);
-        t.commit(`  messages  ${this.agent.messages.length}${branches ? ` · ${branches} branch${branches > 1 ? 'es' : ''} (/tree)` : ''}`);
-        t.commit(`  model     ${formatRef(this.o.model)} · thinking ${this.agent.thinking}`);
-        t.commit(`  context   ${formatTokens(this.agent.contextUsed)} of ${formatTokens(this.model.contextWindow)}`);
-        t.commit(`  tokens    ${formatTokens(u.input)} in · ${formatTokens(u.cacheRead)} cached · ${formatTokens(u.cacheWrite)} cache writes · ${formatTokens(u.output)} out`);
-        t.commit(`  cost      ${this.model.price || this.agent.costUSD ? '$' + this.agent.costUSD.toFixed(4) : 'unknown for this model'}`);
-        t.blank();
-        return;
-      }
-      case 'compact':
-        if (this.agent.messages.length < 2) return t.notice('Nothing to compact yet.');
-        return this.withTurn(async (signal) => {
-          await this.agent.compact(signal, { instructions: args || undefined });
-        });
-      case 'copy':
-        return this.copyLast();
-      case 'export': {
-        const file = resolve(this.o.cwd, args || `wisp-${this.session.name?.replace(/\W+/g, '-') ?? this.session.id}.html`);
-        exportSession(file, this.agent.messages, this.session.name ?? `wisp session ${this.session.id}`);
-        return t.notice(`Saved to ${shortenHome(file)}`, 'success');
-      }
-      case 'reload':
-        this.discover();
-        this.agent.opts.system = this.systemPrompt();
-        return t.notice(`Reloaded: ${this.contextFiles.length} context files, ${this.skills.length} skills, ${this.templates.length} prompt templates.`);
-      case 'settings': {
-        if (!existsSync(GLOBAL_SETTINGS)) this.o.settings.saveGlobal({});
-        if (!(await this.externalEditorFile(GLOBAL_SETTINGS))) return;
-        try {
-          this.o.settings.reload();
-        } catch (err) {
-          return t.notice(`${describeError(err)} — keeping the previous settings.`, 'error');
-        }
-        const s = this.o.settings.merged;
-        this.showThinking = s.showThinking ?? this.showThinking;
-        this.agent.opts.autoCompactAt = s.autoCompactAt;
-        this.agent.opts.maxTokens = s.maxTokens;
-        return t.notice(`Reloaded ${shortenHome(GLOBAL_SETTINGS)}.`, 'success');
-      }
-      case 'mouse':
-        if (!this.full) return t.notice('Mouse capture is only used in fullscreen mode.');
-        this.term.setMouse(!this.term.mouse);
-        return this.flashMessage(this.term.mouse ? 'mouse captured: wheel scrolls (shift+drag selects)' : 'mouse released: select text normally · pgup/pgdn scrolls', 3000);
-      case 'mcp':
-        return this.mcpCommand(args);
-      case 'exit':
-      case 'quit':
-        return this.exit();
+      return this.render();
     }
     if (name?.startsWith('skill:')) {
       const skill = this.skills.find((s) => s.name === name.slice(6));
@@ -1435,7 +1364,165 @@ export class App {
     }
     const tpl = this.templates.find((x) => x.name === name);
     if (tpl) return this.prompt(expandTemplate(tpl, args), input);
-    t.notice(`Unknown command /${name}. Press ? to see all commands.`, 'error');
+    const near = this.commandList().find((c) => name && (c.name.startsWith(name) || name.startsWith(c.name)));
+    t.notice(`Unknown command /${name}.${near ? ` Did you mean /${near.name}?` : ''} Press ? to see all commands.`, 'error');
+  }
+
+  /** Built-in slash commands. None takes required arguments; whileBusy ones work during a turn. */
+  private coreCommands(): SlashCommand[] {
+    const t = this.transcript;
+    return [
+      { name: 'help', description: 'Shortcuts and commands (?)', whileBusy: true, run: () => this.openHelp() },
+      { name: 'model', description: 'Switch model (ctrl+l)', whileBusy: true, run: (args) => this.openModelPicker(args) },
+      { name: 'thinking', description: 'How hard the model thinks (shift+tab)', whileBusy: true, run: (args) => this.openThinking(args) },
+      { name: 'settings', description: 'All settings, applied right away', whileBusy: true, run: () => this.openSettings() },
+      { name: 'login', description: 'Connect Anthropic, OpenAI or Ollama', run: () => this.openLogin() },
+      { name: 'logout', description: 'Remove a saved API key', run: () => this.openLogout() },
+      { name: 'new', description: 'Start a new conversation', run: () => this.newSession() },
+      { name: 'resume', description: 'Open a saved conversation', run: () => this.openResume(false) },
+      { name: 'tree', description: 'Browse branches of this conversation and jump back', whileBusy: true, run: () => this.openTree() },
+      { name: 'fork', description: 'Copy this conversation (up to a message) into a new one', run: () => this.openFork() },
+      {
+        name: 'compact',
+        description: 'Summarize the conversation to free up context',
+        run: async (args) => {
+          if (this.agent.messages.length < 2) return t.notice('Nothing to compact yet.');
+          await this.withTurn(async (signal) => {
+            await this.agent.compact(signal, { instructions: args || undefined });
+          });
+        },
+      },
+      { name: 'name', description: 'Name this conversation', whileBusy: true, run: (args) => this.openName(args) },
+      { name: 'session', description: 'Conversation info: file, tokens, cost', whileBusy: true, run: () => this.sessionInfo() },
+      { name: 'copy', description: 'Copy the last response (ctrl+x)', whileBusy: true, run: () => this.copyLast() },
+      { name: 'export', description: 'Save the conversation as HTML or Markdown', whileBusy: true, run: (args) => this.openExport(args) },
+      { name: 'mcp', description: 'MCP servers: status, tools, reconnect', whileBusy: true, run: () => this.mcpCommand() },
+      {
+        name: 'reload',
+        description: 'Reload AGENTS.md, skills, prompt templates and settings files',
+        run: () => {
+          this.discover();
+          this.agent.opts.system = this.systemPrompt();
+          this.o.settings.reloadAndApply();
+          this.showSettingsWarnings();
+          t.notice(`Reloaded: ${this.contextFiles.length} context files, ${this.skills.length} skills, ${this.templates.length} prompt templates, settings.`);
+        },
+      },
+      {
+        name: 'mouse',
+        description: 'Release / capture the mouse (to select text)',
+        whileBusy: true,
+        run: () => {
+          // saved as the default and applied live through the settings store
+          const r = this.o.settings.set('mouse', !this.term.mouse);
+          this.flashMessage((this.term.mouse ? 'mouse captured: wheel scrolls (shift+drag selects)' : 'mouse released: select text normally · pgup/pgdn scrolls') + this.persistNote('mouse', r), 3000);
+        },
+      },
+      { name: 'exit', description: 'Quit (ctrl+d)', whileBusy: true, run: () => this.exit() },
+    ];
+  }
+
+  private openThinking(args: string) {
+    if (args && THINKING_LEVELS.includes(args as ThinkingLevel)) return this.setThinking(args as ThinkingLevel);
+    const levels = this.model.thinking;
+    const describe: Record<ThinkingLevel, string> = {
+      off: 'answer straight away',
+      low: 'quick, light reasoning',
+      medium: 'balanced (default)',
+      high: 'more careful',
+      xhigh: 'very careful, slower',
+      max: 'deepest, slowest, priciest',
+    };
+    const list = new SelectList(levels.map((l) => ({ label: l, value: l, detail: describe[l] })), { initial: levels.indexOf(this.agent.thinking) });
+    this.openDialog(new Dialog<ThinkingLevel>({ title: `How hard should ${shortModelName(this.model)} think?`, width: 60, list, onSelect: (l) => this.setThinking(l) }));
+  }
+
+  private setName(name: string) {
+    const n = name.trim();
+    if (!n) return;
+    this.session.log({ type: 'name', name: n });
+    this.flashMessage(`named “${n}”`);
+  }
+
+  private openName(args: string) {
+    if (args) return this.setName(args);
+    const input = new TextInput({ initial: this.session.name ?? '', placeholder: 'e.g. fix login redirect' });
+    this.openDialog(new Dialog({ title: 'Name this conversation', width: 70, input, onSubmit: (v) => void this.setName(v), hint: 'enter save · esc cancel' }));
+  }
+
+  /** Exports go to ~/.wisp/exports by default, never into the project. */
+  private openExport(args: string) {
+    const slug = (this.session.name?.replace(/\W+/g, '-').replace(/^-|-$/g, '') || this.session.id).slice(0, 60);
+    const write = (file: string) => {
+      const f = file.trim();
+      if (!f) return;
+      const path = resolve(this.o.cwd, f.replace(/^~(?=\/)/, process.env.HOME ?? '~'));
+      try {
+        mkdirSync(join(path, '..'), { recursive: true });
+        exportSession(path, this.agent.messages, this.session.name ?? `wisp session ${this.session.id}`);
+        this.transcript.notice(`Saved to ${shortenHome(path)}`, 'success');
+      } catch (err) {
+        this.transcript.notice(`Could not export: ${describeError(err)}`, 'error');
+      }
+      this.render();
+    };
+    if (args) return write(args);
+    const input = new TextInput({ initial: shortenHome(join(AGENT_DIR, 'exports', `${slug}.html`)) });
+    this.openDialog(
+      new Dialog({ title: 'Export conversation', width: 90, body: () => ['Where to save it? End the name in .md for Markdown.'], input, onSubmit: (v) => void write(v), hint: 'enter save · esc cancel' }),
+    );
+  }
+
+  private sessionInfo() {
+    const t = this.transcript;
+    const u = this.agent.usage;
+    const branches = countBranches(buildTurnTree(this.session.entries));
+    t.blank();
+    t.commit(theme.bold('This conversation'));
+    t.commit(`  id        ${this.session.id}${this.session.name ? ` (${this.session.name})` : ''}`);
+    t.commit(`  file      ${this.session.path ? shortenHome(this.session.path) : '(not saved: --no-session)'}`);
+    t.commit(`  messages  ${this.agent.messages.length}${branches ? ` · ${branches} branch${branches > 1 ? 'es' : ''} (/tree)` : ''}`);
+    t.commit(`  model     ${formatRef(this.o.model)} · thinking ${this.agent.thinking}`);
+    t.commit(`  context   ${formatTokens(this.agent.contextUsed)} of ${formatTokens(this.model.contextWindow)}`);
+    t.commit(`  tokens    ${formatTokens(u.input)} in · ${formatTokens(u.cacheRead)} cached · ${formatTokens(u.cacheWrite)} cache writes · ${formatTokens(u.output)} out`);
+    t.commit(`  cost      ${this.model.price || this.agent.costUSD ? '$' + this.agent.costUSD.toFixed(4) : 'unknown for this model'}`);
+    t.blank();
+  }
+
+  /** Every visible setting; enter cycles the value (saved globally), p saves it for this project only. */
+  private openSettings() {
+    const st = this.o.settings;
+    const rows = () =>
+      [...st.defs.values()]
+        .filter((d) => !d.hidden)
+        .map((d) => {
+          const src = st.source(d.key);
+          const where = src === 'project' ? theme.warn(' · project') : '';
+          return { label: `${d.label}  ${theme.accent(st.format(d.key))}${where}`, detail: d.description, keywords: d.key, value: d.key };
+        });
+    const list = new SelectList(rows());
+    let d: Dialog<string>;
+    const change = (key: string, scope: Scope) => {
+      const next = st.nextValue(key);
+      const r = st.set(key, next, scope);
+      list.setOptions(rows());
+      const def = st.defs.get(key)!;
+      if (r.error) d.setStatus(`Not saved: ${r.error}`, 'error');
+      else if (r.overridden) d.setStatus(`${def.label} saved globally, but this project's .wisp/settings.json sets it to ${st.format(key)}. Press p to change it for this project.`, 'error');
+      else d.setStatus(`${def.label}: ${st.format(key)} · saved to ${shortenHome(st.path(scope))}`, 'success');
+      this.render();
+      return true;
+    };
+    d = new Dialog<string>({
+      title: 'Settings',
+      width: 100,
+      body: () => [theme.dim(`global ${shortenHome(st.path('global'))} · project ${shortenHome(st.path('project'))} (wins)`)],
+      list,
+      onSelect: (key) => change(key, 'global'),
+      keys: [{ key: 'p', label: 'save for this project', run: (key) => (key ? change(key, 'project') : true) }],
+      hint: 'enter change · p change for this project only · esc close',
+    });
+    this.openDialog(d);
   }
 }
 
