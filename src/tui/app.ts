@@ -573,14 +573,15 @@ export class App {
     if (a.costUSD > 0) right.push(theme.dim(`$${a.costUSD.toFixed(a.costUSD < 1 ? 3 : 2)}`));
     const line1 = spread(theme.dim(where + name), right.join(theme.dim(' · ')), w);
 
-    let hint: string;
-    if (this.flash && this.flash.until > Date.now()) hint = theme.accent(this.flash.text);
-    else if (this.full && !this.full.following) hint = theme.dim('end or esc · back to the latest   pgup/pgdn · scroll');
-    else if (this.busy) hint = theme.dim('esc stop · enter adds a note for the next step · alt+enter queue · ctrl+o output');
-    else if (!this.configured) hint = theme.dim('/login to set up a model · ? help');
-    else if (!this.editor.isEmpty) hint = theme.dim('enter send · shift+enter new line · @ attach · ctrl+g editor');
-    else hint = theme.dim('enter send · / commands · @ files · ! shell · ? help');
-    return [line1, truncate(hint, w)];
+    if (this.flash && this.flash.until > Date.now()) return [line1, truncate(theme.accent(this.flash.text), w)];
+    // [text, priority]: when the line is too narrow, the lowest priorities go first
+    let hints: [string, number][];
+    if (this.full && !this.full.following) hints = [['end back to latest', 3], ['pgup/pgdn scroll', 2], ['esc', 1]];
+    else if (this.busy) hints = [['esc stop', 5], ['enter add a note', 3], ['alt+enter queue', 2], ['ctrl+o output', 1]];
+    else if (!this.configured) hints = [['/login set up a model', 5], ['? help', 4]];
+    else if (!this.editor.isEmpty) hints = [['enter send', 5], ['shift+enter new line', 3], ['@ attach', 2], ['ctrl+g editor', 1]];
+    else hints = [['enter send', 3], ['/ commands', 4], ['@ files', 2], ['! shell', 1], ['? help', 5]];
+    return [line1, theme.dim(fitHints(hints, w))];
   }
 
   private flashMessage(text: string, ms = 1800) {
@@ -1449,6 +1450,17 @@ function lastAssistantText(messages: import('../core/types.js').Message[]): stri
     if (text.trim()) return text;
   }
   return '';
+}
+
+/** Join hints with " · ", dropping the least important ones until they fit. */
+export function fitHints(hints: [string, number][], width: number): string {
+  let kept = hints;
+  const join = (h: [string, number][]) => h.map(([t]) => t).join(' · ');
+  while (kept.length > 1 && stringWidth(join(kept)) > width) {
+    const lowest = Math.min(...kept.map(([, p]) => p));
+    kept = kept.filter(([, p]) => p !== lowest);
+  }
+  return truncate(join(kept), width);
 }
 
 function relativeTime(d: Date): string {

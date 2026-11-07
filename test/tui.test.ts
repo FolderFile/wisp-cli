@@ -175,3 +175,22 @@ test('wrap: no stray space at the start of continuation rows; indentation kept',
   assert.deepEqual(wrap('    indented code', 40), ['    indented code']);
   assert.ok(wrap('\x1b[2mone two three four\x1b[22m', 9).every((r) => !strip(r).startsWith(' ')));
 });
+
+test('footer hints drop whole items (lowest priority first) instead of cutting words', async () => {
+  const { fitHints } = await import('../src/tui/app.ts');
+  const hints: [string, number][] = [['enter send', 3], ['/ commands', 4], ['@ files', 2], ['! shell', 1], ['? help', 5]];
+  assert.equal(fitHints(hints, 80), 'enter send · / commands · @ files · ! shell · ? help');
+  assert.equal(fitHints(hints, 40), 'enter send · / commands · ? help');
+  assert.equal(fitHints(hints, 22), '/ commands · ? help');
+});
+
+test('fullscreen: the input stays pinned to the bottom even when the conversation is short', async () => {
+  const { FullScreen } = await import('../src/tui/fullscreen.ts');
+  let written = '';
+  const term = { columns: 40, rows: 12, write: (s: string) => (written += s) } as any;
+  const fs = new FullScreen(term);
+  fs.draw(() => ['header'], ['─ border', '› ', '─ border', 'footer'], { row: 1, col: 2 });
+  fs.flush();
+  assert.match(written, /\x1b\[9;1H\x1b\[2K─ border/, 'bottom area starts at row 9 of 12');
+  assert.match(written, /\x1b\[10;3H/, 'cursor on the input row');
+});

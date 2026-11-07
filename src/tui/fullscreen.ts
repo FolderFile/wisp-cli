@@ -122,11 +122,10 @@ export class FullScreen {
     this.lastTop = top;
     this.lastMaxTop = maxTop;
 
-    // While the conversation is shorter than the screen, the input sits right
-    // under it (like a chat); once it fills the screen the input is pinned.
-    const float = !this.overlay && total < viewH;
+    // The input and footer are always pinned to the bottom of the screen;
+    // the conversation fills the space above, starting at the top.
     const view = this.transcript.slice(top, top + viewH);
-    if (!float) while (view.length < viewH) view.push('');
+    while (view.length < viewH) view.push('');
     const below = total - (top + viewH);
     if (this.scrollTop !== null && below > 0 && viewH > 0) {
       const label = ` ↓ ${below} more line${below === 1 ? '' : 's'} · scroll, PgDn or End to return `;
